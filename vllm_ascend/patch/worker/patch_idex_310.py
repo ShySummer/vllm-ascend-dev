@@ -27,6 +27,9 @@ gdn_ops.update_conv1d_graph_params = update_conv1d_graph_params_310p
 AscendSpecDecodeBaseProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
     AscendSpecDecodeBaseProposer310.set_inputs_first_pass
 )
+AscendSpecDecodeBaseProposer.prepare_inputs_padded = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310.prepare_inputs_padded
+)
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does
 # not exist in the triton version used on 310P CI, and NPU does not use these
 # CUDA warmup kernel anyway.
