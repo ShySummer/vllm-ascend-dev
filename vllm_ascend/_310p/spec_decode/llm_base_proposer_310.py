@@ -36,16 +36,31 @@ class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
         token_indices_to_sample: torch.Tensor,
         num_tokens: int,
     ) -> None:
-        # 310P occasionally faults on the tiny device slice/clone/index-write
-        # sequence used to shift MTP input_ids. Stage the small id vector on CPU
-        # and upload it once to keep the graph input buffer deterministic.
-        input_ids_cpu = target_token_ids[:num_tokens].detach().cpu()
+        # 310P may overwrite a few tail elements for this tiny D2D slice copy.
+        # Keep the risky shift isolated in a scratch buffer, sanitize the
+        # aligned tail, then publish one clean slice to the persistent graph
+        # input_ids buffer.
+        align = 8
+        aligned_tokens = min(
+            ((num_tokens + align - 1) // align) * align,
+            self.input_ids.shape[0],
+        )
+        stage = getattr(self, "_input_ids_stage_310p", None)
+        if (
+            stage is None
+            or stage.shape[0] < aligned_tokens
+            or stage.device != self.input_ids.device
+            or stage.dtype != self.input_ids.dtype
+        ):
+            stage = torch.empty_like(self.input_ids)
+            self._input_ids_stage_310p = stage
+
+        stage[:aligned_tokens].zero_()
         if num_tokens > 1:
-            input_ids_cpu[:-1] = input_ids_cpu[1:].clone()
-        input_ids_cpu[-1] = 0
-        token_indices_cpu = token_indices_to_sample.detach().cpu().to(torch.long)
-        input_ids_cpu[token_indices_cpu] = next_token_ids.detach().cpu()
-        self.input_ids[:num_tokens].copy_(input_ids_cpu, non_blocking=True)
+            stage[: num_tokens - 1] = target_token_ids[1:num_tokens]
+            stage[num_tokens - 1 : aligned_tokens].zero_()
+        stage[token_indices_to_sample] = next_token_ids
+        self.input_ids[:aligned_tokens].copy_(stage[:aligned_tokens], non_blocking=True)
 
     def prepare_inputs_padded(
         self,
