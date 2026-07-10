@@ -19,12 +19,76 @@ from typing import Any
 
 import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
 
 class AscendSpecDecodeBaseProposer310(AscendSpecDecodeBaseProposer):
     """310P proposer overrides for NPU-specific spec-decode workarounds."""
+
+    def prepare_inputs_padded(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        spec_decode_metadata: SpecDecodeMetadata,
+        valid_sampled_tokens_count: torch.Tensor,
+    ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_reqs = common_attn_metadata.num_reqs
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens[:num_reqs]
+        valid_sampled_tokens_count = valid_sampled_tokens_count[:num_reqs].to(torch.int64)
+
+        num_draft_tokens_gpu = torch.cat(
+            [
+                cu_num_draft_tokens[0:1],
+                cu_num_draft_tokens[1:] - cu_num_draft_tokens[:-1],
+            ]
+        )
+        num_draft_tokens_i64 = num_draft_tokens_gpu.to(torch.int64)
+
+        num_rejected_tokens_i64 = torch.where(
+            num_draft_tokens_i64 > 0,
+            num_draft_tokens_i64 + 1 - valid_sampled_tokens_count,
+            torch.zeros_like(num_draft_tokens_i64),
+        )
+        num_rejected_tokens_gpu = num_rejected_tokens_i64.to(torch.int32)
+
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1].to(torch.int64)
+        token_indices_to_sample = (query_start_loc[1:] - 1 - num_rejected_tokens_i64).to(torch.int32)
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+
+        new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+
+        total_num_tokens = query_start_loc_cpu[-1].item()
+        token_indices = self.arange[:total_num_tokens]
+
+        spec_common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=common_attn_metadata.query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=common_attn_metadata.seq_lens_cpu,
+            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens if self.pcp_size > 1 else total_num_tokens,
+            num_input_tokens=common_attn_metadata.num_input_tokens,
+            max_query_len=new_query_len_per_req.max().item(),
+            actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            slot_mapping_cpu=common_attn_metadata.slot_mapping_cpu,
+            positions=common_attn_metadata.positions,
+            positions_cpu=common_attn_metadata.positions_cpu,
+            attn_state=self.runner.attn_state,
+            decode_token_per_req=self.runner.decode_token_per_req,
+            num_computed_tokens_cpu=common_attn_metadata.num_computed_tokens_cpu,
+            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            seq_lens=common_attn_metadata.seq_lens,
+            is_prefilling=common_attn_metadata.is_prefilling,
+            max_seq_len=0,
+        )
+
+        return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu
 
     def set_inputs_first_pass(
         self,

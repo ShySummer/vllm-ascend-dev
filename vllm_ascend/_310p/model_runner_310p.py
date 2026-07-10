@@ -51,15 +51,37 @@ from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
+from vllm_ascend._310p.spec_decode.llm_base_proposer_310 import AscendSpecDecodeBaseProposer310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.spec_decode.utils import (
-    update_num_computed_tokens_for_batch_change,
-)
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_rc_device, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
+
+
+def _update_num_computed_tokens_for_batch_change_310p(
+    num_computed_tokens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    prev_positions: torch.Tensor,
+    valid_sampled_token_count: torch.Tensor,
+    prev_num_draft_tokens: torch.Tensor,
+    cpu_num_computed_tokens: torch.Tensor,
+) -> None:
+    gather_indices = prev_positions.clamp(min=0)
+
+    valid_counts = valid_sampled_token_count[gather_indices]
+    prev_computed = num_computed_tokens[gather_indices]
+    prev_drafts = prev_num_draft_tokens[gather_indices]
+
+    participating = (prev_positions >= 0) & (prev_drafts > 0)
+    corrected = prev_computed.to(torch.int64) + valid_counts.to(torch.int64)
+
+    n = prev_positions.shape[0]
+    num_computed_tokens[:n].copy_(
+        torch.where(participating, corrected, cpu_num_computed_tokens.to(torch.int64)).to(num_computed_tokens.dtype)
+    )
+    num_accepted_tokens.copy_(torch.where(participating, valid_counts, num_accepted_tokens))
 
 
 class NPUModelRunner310(NPUModelRunner):
@@ -107,6 +129,10 @@ class NPUModelRunner310(NPUModelRunner):
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
+        if self.drafter is not None and hasattr(self.drafter, "prepare_inputs_padded"):
+            self.drafter.prepare_inputs_padded = (  # type: ignore[attr-defined, method-assign]
+                AscendSpecDecodeBaseProposer310.prepare_inputs_padded.__get__(self.drafter, type(self.drafter))
+            )
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
@@ -477,7 +503,7 @@ class NPUModelRunner310(NPUModelRunner):
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
                 device=self.device, non_blocking=True
             )
-            update_num_computed_tokens_for_batch_change(
+            _update_num_computed_tokens_for_batch_change_310p(
                 self.num_computed_tokens,
                 self.num_accepted_tokens.gpu[:num_reqs],
                 self.prev_positions.gpu[:num_reqs],
@@ -503,7 +529,8 @@ class NPUModelRunner310(NPUModelRunner):
             non_blocking=True,
         )
         if need_async_num_computed_update:
-            self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            seq_lens = self.num_computed_tokens[:num_reqs].to(torch.int64) + num_scheduled_tokens_gpu.to(torch.int64)
+            self.seq_lens[:num_reqs].copy_(seq_lens.to(self.seq_lens.dtype), non_blocking=True)
             if is_rc_device():
                 tail_len = self.seq_lens.shape[0] - num_reqs
                 if tail_len > 0:
@@ -602,6 +629,57 @@ class NPUModelRunner310(NPUModelRunner):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+        )
+
+    def _calc_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        num_pcp_pads: np.ndarray | None,
+    ) -> SpecDecodeMetadata:
+        if self.pcp_size > 1:
+            return super()._calc_spec_decode_metadata(num_draft_tokens, cu_num_scheduled_tokens, num_pcp_pads)
+
+        num_sampled_tokens = num_draft_tokens + 1
+        cu_num_sampled_tokens = self._get_cumsum_and_arange(
+            num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32
+        )
+
+        logits_indices = np.repeat(cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens)
+        logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]
+
+        bonus_logits_indices = cu_num_sampled_tokens - 1
+
+        cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
+        total_num_draft_tokens = cu_num_draft_tokens[-1]
+        cumsums_offsets = np.repeat(cu_num_draft_tokens - num_draft_tokens, num_draft_tokens)
+        arange = self.arange_np[:total_num_draft_tokens] - cumsums_offsets
+        target_logits_indices = np.repeat(cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens)
+        target_logits_indices += arange
+
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).pin_memory().to(self.device, non_blocking=True)
+        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).pin_memory().to(
+            self.device, non_blocking=True
+        )
+        logits_indices = torch.from_numpy(logits_indices).pin_memory().to(self.device, non_blocking=True)
+        target_logits_indices = torch.from_numpy(target_logits_indices).pin_memory().to(
+            self.device, non_blocking=True
+        )
+        target_logits_indices_plus_one = target_logits_indices.to(torch.int64) + 1
+        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).pin_memory().to(
+            self.device, non_blocking=True
+        )
+
+        draft_token_ids = self.input_ids.gpu[logits_indices]
+        draft_token_ids = draft_token_ids[target_logits_indices_plus_one]
+        return SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=cu_num_draft_tokens,
+            cu_num_sampled_tokens=cu_num_sampled_tokens,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices,
         )
 
     @torch.inference_mode()
