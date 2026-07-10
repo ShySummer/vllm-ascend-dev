@@ -117,6 +117,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -1261,8 +1262,10 @@ class NPUModelRunner(GPUModelRunner):
                 + self.query_pos.gpu[:total_num_scheduled_tokens]
             )
 
-        self.seq_lens[:num_reqs] = (
-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+        self.seq_lens[:num_reqs] = DeviceOperator.metadata_add(
+            self.num_computed_tokens[:num_reqs],
+            num_scheduled_tokens_gpu,
+            out_dtype=self.seq_lens.dtype,
         )
         self.seq_lens[num_reqs:].fill_(0)
 
@@ -1685,7 +1688,7 @@ class NPUModelRunner(GPUModelRunner):
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = draft_token_ids[DeviceOperator.metadata_add(target_logits_indices, 1)]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
         return SpecDecodeMetadata(

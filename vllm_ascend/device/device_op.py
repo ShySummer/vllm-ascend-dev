@@ -44,6 +44,26 @@ else:
 
 
 class BaseDeviceAdaptor:
+    @staticmethod
+    def metadata_add(lhs: torch.Tensor, rhs: Any, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        result = lhs + rhs
+        return result.to(out_dtype) if out_dtype is not None else result
+
+    @staticmethod
+    def metadata_add_sub(
+        lhs: torch.Tensor,
+        addend: Any,
+        subtrahend: Any,
+        *,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        result = lhs + addend - subtrahend
+        return result.to(out_dtype) if out_dtype is not None else result
+
+    @staticmethod
+    def use_prepare_inputs_padded_kernel() -> bool:
+        return True
+
     @classmethod
     def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
         torch_npu._npu_reshape_and_cache(
@@ -1813,6 +1833,31 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
 
 class Ascend310PDeviceAdaptor(BaseDeviceAdaptor):
+    @staticmethod
+    def _metadata_to_i64(value: Any) -> Any:
+        return value.to(torch.int64) if isinstance(value, torch.Tensor) else value
+
+    @classmethod
+    def metadata_add(cls, lhs: torch.Tensor, rhs: Any, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        result = cls._metadata_to_i64(lhs) + cls._metadata_to_i64(rhs)
+        return result.to(out_dtype) if out_dtype is not None else result
+
+    @classmethod
+    def metadata_add_sub(
+        cls,
+        lhs: torch.Tensor,
+        addend: Any,
+        subtrahend: Any,
+        *,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        result = cls._metadata_to_i64(lhs) + cls._metadata_to_i64(addend) - cls._metadata_to_i64(subtrahend)
+        return result.to(out_dtype) if out_dtype is not None else result
+
+    @staticmethod
+    def use_prepare_inputs_padded_kernel() -> bool:
+        return False
+
     @staticmethod
     def index_fill(
         tensor: torch.Tensor,

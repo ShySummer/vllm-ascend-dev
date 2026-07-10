@@ -3,6 +3,7 @@
 import numpy as np
 import torch
 
+from vllm_ascend.device.device_op import DeviceOperator
 
 def update_num_computed_tokens_for_batch_change(
     num_computed_tokens: torch.Tensor,
@@ -25,10 +26,17 @@ def update_num_computed_tokens_for_batch_change(
     prev_drafts = prev_num_draft_tokens[gather_indices]
 
     participating = (prev_positions >= 0) & (prev_drafts > 0)
-    corrected = prev_computed + valid_counts.int()
+
+    corrected = DeviceOperator.metadata_add(
+        prev_computed,
+        valid_counts.int(),
+        out_dtype=num_computed_tokens.dtype,
+    )
 
     n = prev_positions.shape[0]
-    num_computed_tokens[:n].copy_(torch.where(participating, corrected, cpu_num_computed_tokens))
+    num_computed_tokens[:n].copy_(
+        torch.where(participating, corrected, cpu_num_computed_tokens.to(corrected.dtype))
+    )
     num_accepted_tokens.copy_(torch.where(participating, valid_counts, num_accepted_tokens))
 
 

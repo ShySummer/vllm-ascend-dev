@@ -52,14 +52,14 @@ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_
 from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.spec_decode.utils import (
-    update_num_computed_tokens_for_batch_change,
-)
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_rc_device, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
+
 
 
 class NPUModelRunner310(NPUModelRunner):
@@ -503,7 +503,12 @@ class NPUModelRunner310(NPUModelRunner):
             non_blocking=True,
         )
         if need_async_num_computed_update:
-            self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+            seq_lens = DeviceOperator.metadata_add(
+                self.num_computed_tokens[:num_reqs],
+                num_scheduled_tokens_gpu,
+                out_dtype=self.seq_lens.dtype,
+            )
+            self.seq_lens[:num_reqs].copy_(seq_lens, non_blocking=True)
             if is_rc_device():
                 tail_len = self.seq_lens.shape[0] - num_reqs
                 if tail_len > 0:

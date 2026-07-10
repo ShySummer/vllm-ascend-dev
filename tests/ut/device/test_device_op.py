@@ -3,7 +3,27 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
+from vllm_ascend.device.device_op import (
+    A5DeviceAdaptor,
+    Ascend310PDeviceAdaptor,
+    BaseDeviceAdaptor,
+)
+
+
+def test_310p_metadata_arithmetic_widens_before_calculation():
+    """310P metadata arithmetic must not overflow int32 intermediates."""
+    lhs = torch.tensor([2**30], dtype=torch.int32)
+
+    added = Ascend310PDeviceAdaptor.metadata_add(lhs, lhs, out_dtype=torch.int64)
+    add_sub = Ascend310PDeviceAdaptor.metadata_add_sub(lhs, lhs, -2, out_dtype=torch.int64)
+
+    torch.testing.assert_close(added, torch.tensor([2**31], dtype=torch.int64))
+    torch.testing.assert_close(add_sub, torch.tensor([2**31 + 2], dtype=torch.int64))
+
+
+def test_310p_disables_triton_prepare_inputs_padded_kernel():
+    assert BaseDeviceAdaptor.use_prepare_inputs_padded_kernel()
+    assert not Ascend310PDeviceAdaptor.use_prepare_inputs_padded_kernel()
 
 
 def test_npu_flash_attention_uses_fusion_attention_for_fp32():

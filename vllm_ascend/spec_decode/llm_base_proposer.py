@@ -2004,7 +2004,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         used as padding and filtered out later by `token_indices_to_sample`.
         No blocking CPU operations should be introduced in this function.
         """
-        if HAS_TRITON:
+        if HAS_TRITON and DeviceOperator.use_prepare_inputs_padded_kernel():
             num_reqs = common_attn_metadata.num_reqs
             device = valid_sampled_tokens_count.device
 
@@ -2034,11 +2034,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             num_rejected_tokens_gpu = torch.where(
                 num_draft_tokens_gpu > 0,
-                num_draft_tokens_gpu + 1 - valid_sampled_tokens_count,
+                DeviceOperator.metadata_add_sub(
+                    num_draft_tokens_gpu,
+                    1,
+                    valid_sampled_tokens_count,
+                    out_dtype=num_draft_tokens_gpu.dtype,
+                ),
                 torch.zeros_like(num_draft_tokens_gpu),
             )
 
-            token_indices_to_sample = common_attn_metadata.query_start_loc[1:] - 1 - num_rejected_tokens_gpu
+            token_indices_to_sample = DeviceOperator.metadata_add_sub(
+                common_attn_metadata.query_start_loc[1:],
+                -1,
+                num_rejected_tokens_gpu,
+                out_dtype=common_attn_metadata.query_start_loc.dtype,
+            )
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
 
