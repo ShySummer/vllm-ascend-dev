@@ -1148,6 +1148,36 @@ class ShortRequestFirstConfig:
             raise ValueError(f"short_request_first_config.long_max_wait_ms must be >= 0; got {self.long_max_wait_ms}")
         return self
 
+@config
+class PrefillAdmissionConfig:
+    """Configuration for low-bandwidth PP prefill admission throttling."""
+
+    enabled: bool = False
+    decode_low_watermark: int = 0
+    prefill_burst_cooldown_ms: float = 1000.0
+    prefill_tokens_per_pp_bubble: int = 512
+
+    @model_validator(mode="after")
+    def _validate_config(self):
+        if self.decode_low_watermark < 0:
+            raise ValueError(
+                "prefill_admission_config.decode_low_watermark "
+                "must be a non-negative int; "
+                f"got {self.decode_low_watermark}"
+            )
+        if self.prefill_burst_cooldown_ms <= 0:
+            raise ValueError(
+                "prefill_admission_config.prefill_burst_cooldown_ms "
+                "must be positive; "
+                f"got {self.prefill_burst_cooldown_ms}"
+            )
+        if self.prefill_tokens_per_pp_bubble <= 0:
+            raise ValueError(
+                "prefill_admission_config.prefill_tokens_per_pp_bubble "
+                "must be a positive int; "
+                f"got {self.prefill_tokens_per_pp_bubble}"
+            )
+        return self
 
 @config
 class DyntraLBConfig:
@@ -1206,6 +1236,7 @@ class SchedulerConfig:
     profiling_chunk_config: ProfilingChunkConfig = dataclasses.field(default_factory=ProfilingChunkConfig)
     batch_job_sched_config: BatchJobSchedConfig = dataclasses.field(default_factory=BatchJobSchedConfig)
     dyntra_lb_config: DyntraLBConfig = dataclasses.field(default_factory=DyntraLBConfig)
+    prefill_admission_config: PrefillAdmissionConfig = dataclasses.field(default_factory=PrefillAdmissionConfig)
 
     @classmethod
     def from_additional_config(cls, additional_config: dict[str, Any]) -> SchedulerConfig:
@@ -1247,6 +1278,9 @@ class SchedulerConfig:
             "profiling_chunk_config": _resolve("profiling_chunk_config", {}),
             "batch_job_sched_config": _resolve("batch_job_sched_config", {}),
             "dyntra_lb_config": scheduler_config.get("dyntra_lb_config", {}),
+            "prefill_admission_config": scheduler_config.get(
+                "prefill_admission_config", {}
+            ),
         }
         # Forward nested unknown keys to pydantic so extra="forbid" reports
         # typos instead of the resolver silently dropping them.

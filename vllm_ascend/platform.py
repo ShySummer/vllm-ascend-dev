@@ -624,6 +624,7 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
     If GPU-specific or currently unsupported parameters are set by the user,
     log a warning and reset them to safe values.
     """
+    
     _validate_eplb_config(vllm_config)
     model_config = vllm_config.model_config
     # ==================== 1. Model Config ====================
@@ -848,6 +849,94 @@ def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
             "greater than 1836s, Set VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000"
         )
 
+def _configure_prefill_admission_scheduler(
+    vllm_config: VllmConfig,
+    scheduler_extension_config: Any,
+) -> None:
+    admission_config = scheduler_extension_config.prefill_admission_config
+
+    if not admission_config.enabled:
+        return
+
+    pipeline_parallel_size = (
+        vllm_config.parallel_config.pipeline_parallel_size
+    )
+
+    if pipeline_parallel_size <= 1:
+        raise ValueError(
+            "prefill_admission_config requires pipeline parallelism "
+            "(pp > 1)."
+        )
+
+    if not vllm_config.scheduler_config.enable_chunked_prefill:
+        raise ValueError(
+            "prefill_admission_config requires chunked prefill."
+        )
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+
+    if kv_transfer_config is not None and kv_role != "kv_both":
+        raise ValueError(
+            "prefill_admission_config only supports PD-mixed mode "
+            "(kv_role='kv_both' or no kv_transfer_config), "
+            "not PD-disaggregated P/D nodes."
+        )
+
+    incompatible_features = []
+
+    if scheduler_extension_config.recompute_scheduler_enable:
+        incompatible_features.append("recompute_scheduler_enable")
+
+    if scheduler_extension_config.profiling_chunk_config.enabled:
+        incompatible_features.append("profiling_chunk_config")
+
+    if scheduler_extension_config.batch_job_sched_config.enabled:
+        incompatible_features.append("batch_job_sched_config")
+
+    if incompatible_features:
+        raise ValueError(
+            "prefill_admission_config cannot be combined with "
+            f"{', '.join(incompatible_features)}."
+        )
+
+    short_request_async_cls = (
+        "vllm_ascend.core.short_request_first_scheduler."
+        "ShortRequestFirstAsyncScheduler"
+    )
+
+    if vllm_config.scheduler_config.async_scheduling:
+        scheduler_cls = (
+            "vllm_ascend.core.prefill_admission_scheduler."
+            "PrefillAdmissionAsyncScheduler"
+        )
+    else:
+        scheduler_cls = (
+            "vllm_ascend.core.prefill_admission_scheduler."
+            "PrefillAdmissionScheduler"
+        )
+
+    current_scheduler_cls = vllm_config.scheduler_config.scheduler_cls
+
+    if current_scheduler_cls not in (
+        None,
+        short_request_async_cls,
+        scheduler_cls,
+    ):
+        raise ValueError(
+            "prefill_admission_config cannot replace an explicitly "
+            f"configured scheduler_cls ({current_scheduler_cls!r})."
+        )
+
+    vllm_config.scheduler_config.scheduler_cls = scheduler_cls
+
+    logger.info(
+        "Enabled token-level prefill admission throttling: "
+        "pipeline_parallel_size=%d, scheduler_cls=%s",
+        pipeline_parallel_size,
+        scheduler_cls,
+    )
+
 
 def _validate_eplb_config(vllm_config: VllmConfig) -> None:
     additional_config = vllm_config.additional_config or {}
@@ -959,6 +1048,11 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             vllm_config.scheduler_config.scheduler_cls = (
                 "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstAsyncScheduler"
             )
+
+    _configure_prefill_admission_scheduler(
+        vllm_config,
+        scheduler_extension_config,
+    )
 
     dyntra_lb_config = scheduler_extension_config.dyntra_lb_config
     if dyntra_lb_config.enabled:
