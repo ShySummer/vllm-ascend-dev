@@ -16,6 +16,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
+    _check_ascend_config,
     _setup_compile_backend,
     _validate_draft_decode_context_parallel_config,
     _validate_eplb_config,
@@ -388,6 +389,7 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.scheduler_config.short_request_first_config.enabled = False
         mock_ascend_config.scheduler_config.profiling_chunk_config.enabled = False
         mock_ascend_config.scheduler_config.dyntra_lb_config.enabled = False
+        mock_ascend_config.scheduler_config.layered_prefill_config.enabled = False
         mock_ascend_config.update_compile_ranges_split_points = MagicMock()
         return mock_ascend_config
 
@@ -662,6 +664,41 @@ class TestNPUPlatform(TestBase):
             _validate_eplb_config(vllm_config)
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+
+    def test_layered_prefill_accepts_tp_gt_one_but_keeps_dp_one(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.parallel_config.tensor_parallel_size = 4
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.enable_dbo = False
+        vllm_config.parallel_config.enable_eplb = False
+        vllm_config.parallel_config.use_sequence_parallel_moe = False
+        vllm_config.model_config.architectures = ["Qwen3MoeForCausalLM"]
+        vllm_config.model_config.enforce_eager = True
+        vllm_config.model_config.is_multimodal = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.enable_return_routed_experts = False
+        vllm_config.lora_config = None
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        vllm_config.scheduler_config.async_scheduling = False
+
+        cache_config = vllm_config.cache_config
+        cache_config.enable_prefix_caching = False
+        cache_config.kv_offloading_size = None
+        cache_config.mamba_cache_mode = "none"
+
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.scheduler_config.layered_prefill_config = SimpleNamespace(enabled=True)
+        ascend_config.sparse_kv_offload_config.enabled = False
+        ascend_config.eplb_config.dynamic_eplb = False
+        ascend_config.enable_prefill_mc2 = False
+        ascend_config.multistream_overlap_shared_expert = False
+
+        _check_ascend_config(vllm_config, ascend_config)
+
+        vllm_config.parallel_config.data_parallel_size = 2
+        with pytest.raises(ValueError, match="requires data_parallel_size=1"):
+            _check_ascend_config(vllm_config, ascend_config)
 
     def test_get_recompute_scheduler_cls(self):
         from vllm_ascend import platform

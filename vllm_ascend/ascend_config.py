@@ -27,6 +27,7 @@ from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.layered_prefill import LayeredPrefillConfig
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.device_config import is_950
@@ -1632,6 +1633,7 @@ class SchedulerConfig:
     profiling_chunk_config: ProfilingChunkConfig = dataclasses.field(default_factory=ProfilingChunkConfig)
     batch_job_sched_config: BatchJobSchedConfig = dataclasses.field(default_factory=BatchJobSchedConfig)
     dyntra_lb_config: DyntraLBConfig = dataclasses.field(default_factory=DyntraLBConfig)
+    layered_prefill_config: LayeredPrefillConfig = dataclasses.field(default_factory=LayeredPrefillConfig)
 
     @classmethod
     def from_additional_config(cls, additional_config: dict[str, Any]) -> SchedulerConfig:
@@ -1643,6 +1645,28 @@ class SchedulerConfig:
             raise ValueError(
                 f"additional_config.scheduler_config must be a dict, got {type(scheduler_config).__name__}."
             )
+        layered_prefill_raw = scheduler_config.get("layered_prefill_config", {})
+        if layered_prefill_raw is None:
+            layered_prefill_raw = {}
+        if not isinstance(layered_prefill_raw, dict):
+            raise ValueError(
+                "additional_config.scheduler_config.layered_prefill_config "
+                f"must be a dict, got {type(layered_prefill_raw).__name__}"
+            )
+        allowed_num_groups = layered_prefill_raw.get(
+            "allowed_num_groups", (1, 2, 4, 8, 16)
+        )
+        if allowed_num_groups is None:
+            allowed_num_groups = (1, 2, 4, 8, 16)
+        layered_prefill_config = LayeredPrefillConfig(
+            enabled=bool(layered_prefill_raw.get("enabled", False)),
+            mode=str(layered_prefill_raw.get("mode", "one_group")),
+            group_token_target=int(layered_prefill_raw.get("group_token_target", 512)),
+            allowed_num_groups=tuple(int(v) for v in allowed_num_groups),
+            max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),
+            require_pd_mixed=bool(layered_prefill_raw.get("require_pd_mixed", True)),
+            require_eager=bool(layered_prefill_raw.get("require_eager", True)),
+        )
 
         def _resolve(config_key: str, default: Any) -> Any:
             if config_key in scheduler_config:
@@ -1673,6 +1697,7 @@ class SchedulerConfig:
             "profiling_chunk_config": _resolve("profiling_chunk_config", {}),
             "batch_job_sched_config": _resolve("batch_job_sched_config", {}),
             "dyntra_lb_config": scheduler_config.get("dyntra_lb_config", {}),
+            "layered_prefill_config": layered_prefill_config,
         }
         # Forward nested unknown keys to pydantic so extra="forbid" reports
         # typos instead of the resolver silently dropping them.

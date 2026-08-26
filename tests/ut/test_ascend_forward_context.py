@@ -278,6 +278,42 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
+    ("executing_layered_subbatch", "enable_expert_parallel", "ep_world_size", "expected"),
+    [
+        (False, True, 4, None),
+        (True, False, 4, None),
+        (True, True, 1, None),
+        (True, True, 4, MoECommType.ALLTOALL),
+    ],
+)
+def test_layered_prefill_comm_override_distinguishes_tp_from_ep(
+    monkeypatch,
+    executing_layered_subbatch,
+    enable_expert_parallel,
+    ep_world_size,
+    expected,
+):
+    """TP-only MoE keeps AllGather; only an actual EP group uses AlltoAll."""
+    monkeypatch.setattr(
+        afc,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=ep_world_size),
+    )
+    vllm_config = _make_vllm_config(
+        enable_expert_parallel=enable_expert_parallel,
+        tensor_parallel_size=4,
+    )
+
+    assert (
+        afc.get_layered_prefill_moe_comm_override(
+            vllm_config,
+            executing_layered_subbatch=executing_layered_subbatch,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
         (128, MoECommType.MC2),
@@ -554,3 +590,47 @@ def test_set_ascend_forward_context_pins_current_vllm_config(monkeypatch, model_
             assert forward_context.moe_comm_method is (expected if model_owned else legacy_method)
 
     assert seen["inside"] is False
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("override", [None, MoECommType.ALLTOALL])
+def test_forward_context_preserves_draft_routing_with_layered_override(monkeypatch, is_draft, override):
+    from contextlib import nullcontext
+
+    forward_context = SimpleNamespace(dp_metadata=None)
+    config = _make_vllm_config()
+    draft_quant = object()
+    config.speculative_config = SimpleNamespace(draft_model_config=SimpleNamespace(draft_moe_quant_type=draft_quant))
+    selector = MagicMock(return_value=MoECommType.ALLGATHER)
+    monkeypatch.setattr(afc, "select_moe_comm_method", selector)
+    monkeypatch.setattr(afc, "set_current_vllm_config", lambda *_a: nullcontext())
+    monkeypatch.setattr(afc, "set_forward_context", lambda **_kw: nullcontext())
+    monkeypatch.setattr(afc, "get_forward_context", lambda: forward_context)
+    monkeypatch.setattr(afc, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(afc, "get_dp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(afc, "has_layer_idx", lambda _m: False)
+    monkeypatch.setattr(afc, "_is_decode_only_node", lambda _c: False)
+    monkeypatch.setattr(afc, "use_cann_megamoe", lambda _c: False)
+    monkeypatch.setattr(afc, "get_mc2_mask", lambda: None)
+    module_name = "vllm_ascend.ops.fused_moe.moe_comm_method"
+    method = object()
+    monkeypatch.setitem(
+        sys.modules,
+        module_name,
+        SimpleNamespace(get_moe_comm_method=lambda _t: method),
+    )
+    with afc.set_ascend_forward_context(
+        None,
+        config,
+        num_tokens=3,
+        is_draft_model=is_draft,
+        moe_comm_type_override=override,
+    ):
+        expected_quant = draft_quant if is_draft else QuantType.NONE
+        assert forward_context.draft_moe_quant_type is expected_quant
+        assert forward_context.moe_comm_type == (override if override is not None else MoECommType.ALLGATHER)
+        assert forward_context.moe_comm_method is method
+    if override is None:
+        selector.assert_called_once_with(3, config, is_draft_model=is_draft, draft_moe_quant_type=expected_quant)
+    else:
+        selector.assert_not_called()

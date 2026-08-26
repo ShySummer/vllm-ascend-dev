@@ -266,8 +266,9 @@ class AlltoAllCommImpl(MoECommMethod):
     2. `npu_grouped_matmul` is available.
 
     This implementation uses all-to-all communication to exchange tokens
-    between data parallel ranks before and after the MLP computation. It should
-    have better performance than AllGatherCommImpl when DP size > 1.
+    between EP ranks before and after the MLP computation.  With TP+EP and
+    DP=1, the EP group is the physical TP group, so this path also covers the
+    layered-prefill Phase 1 topology.
     """
 
     shared_activation_overlaps_routed_gmm1 = True
