@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict, deque
@@ -256,7 +257,6 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
-    get_layered_prefill_moe_comm_override,
     get_mc2_tokens_capacity,
     select_moe_comm_method,
     set_ascend_forward_context,
@@ -679,6 +679,7 @@ class NPUModelRunner(GPUModelRunner):
         ) = None
         self.layered_prefill_input_batch: NPUInputBatch | None = None
         self._executing_layered_subbatch = False
+        self._layered_moe_comm_token_count: int | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -2513,6 +2514,10 @@ class NPUModelRunner(GPUModelRunner):
         p_input_batch = self._get_layered_prefill_input_batch(len(p_req_ids))
         sub_batches: list[LayeredSubBatchState] = []
 
+        # Both subbatches represent one logical scheduler step.  Feed the
+        # combined token count to the shared MoE selector so a short D query
+        # cannot choose MC2 while the long P query chooses AllGather.
+        self._layered_moe_comm_token_count = scheduler_output.total_num_scheduled_tokens
         self._executing_layered_subbatch = True
         one_time_updates_pending = True
         try:
@@ -2544,6 +2549,13 @@ class NPUModelRunner(GPUModelRunner):
                         "Layered prefill Phase 1 expects PP=1 execute_model to "
                         "return None"
                     )
+                if active_batch is main_input_batch and p_req_ids:
+                    # D and P can legitimately select different MoE backends
+                    # (for example MC2 for a one-token D batch and AllGather
+                    # for a long P batch).  Their collectives may use distinct
+                    # runtime streams, so establish a visible boundary before
+                    # starting the next subbatch.
+                    torch.npu.synchronize()
                 execute_state = self.execute_model_state
                 if not isinstance(execute_state, ExecuteModelState):
                     raise RuntimeError("Missing execute state for layered subbatch")
@@ -2576,6 +2588,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.kv_connector_output = None
         finally:
             self._executing_layered_subbatch = False
+            self._layered_moe_comm_token_count = None
             self.input_batch = main_input_batch
 
         self.execute_model_state = LayeredExecuteModelState(
@@ -3108,12 +3121,8 @@ class NPUModelRunner(GPUModelRunner):
                 skip_compiled=has_encoder_input,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-                # TP-only MoE keeps its normal AllGather path.  The helper
-                # selects AlltoAll only when this layered subbatch is backed
-                # by a real EP group.
-                moe_comm_type_override=get_layered_prefill_moe_comm_override(
-                    self.vllm_config,
-                    executing_layered_subbatch=self._executing_layered_subbatch,
+                moe_comm_token_count=getattr(
+                    self, "_layered_moe_comm_token_count", None
                 ),
             ),
             self.maybe_get_kv_connector_output(
@@ -3641,13 +3650,32 @@ class NPUModelRunner(GPUModelRunner):
         # Sample the next token and get logprobs if needed.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self.input_batch.sampling_metadata
+        trace_sampling = (
+            self._executing_layered_subbatch
+            and os.environ.get("VLLM_LAYERED_PREFILL_TRACE") == "1"
+        )
+        if trace_sampling and logits is not None:
+            logger.info(
+                "Layered sample enter req_ids=%s logits_shape=%s "
+                "argmax=%s",
+                self.input_batch.req_ids,
+                tuple(logits.shape),
+                logits.argmax(dim=-1).detach().cpu().tolist(),
+            )
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            return self.sampler(
+            result = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            if trace_sampling:
+                logger.info(
+                    "Layered sample output req_ids=%s sampled=%s",
+                    self.input_batch.req_ids,
+                    result.sampled_token_ids.detach().cpu().tolist(),
+                )
+            return result
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]

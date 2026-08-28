@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
+from vllm_ascend.worker import model_runner_v1 as runner_module
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -78,3 +81,36 @@ def test_layered_subbatch_uses_current_scheduler_output_fields(include_one_time_
     if updates:
         result.block_table_updates.clear()
         assert set(output.block_table_updates) == {"a", "b", "other"}
+
+
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize("lmhead_tp", [False, True])
+def test_layered_sample_uses_current_sampler_interface(monkeypatch, trace, lmhead_tp):
+    monkeypatch.setenv("VLLM_LAYERED_PREFILL_TRACE", "1" if trace else "0")
+    monkeypatch.setattr(runner_module, "lmhead_tp_enable", lambda: lmhead_tp)
+    log = MagicMock()
+    monkeypatch.setattr(runner_module, "logger", log)
+    metadata = SimpleNamespace(top_k=torch.tensor([2, 2]))
+    sampled = SimpleNamespace(sampled_token_ids=torch.tensor([[1], [2]]))
+    # An explicit callable spec has no obsolete prepare_sampling method.
+    sampler = MagicMock(spec=lambda logits, sampling_metadata: None, return_value=sampled)
+    batch = SimpleNamespace(
+        update_async_output_token_ids=MagicMock(),
+        sampling_metadata=metadata,
+        num_reqs=2,
+        req_ids=["a", "b"],
+    )
+    runner = SimpleNamespace(
+        input_batch=batch,
+        sampler=sampler,
+        _executing_layered_subbatch=True,
+    )
+    logits = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    result = NPUModelRunner._sample(runner, logits, None)
+    assert result is sampled
+    batch.update_async_output_token_ids.assert_called_once_with()
+    sampler.assert_called_once()
+    args = sampler.call_args.kwargs
+    assert args["sampling_metadata"] is metadata
+    torch.testing.assert_close(args["logits"], logits[:2] if lmhead_tp else logits)
+    assert log.info.call_count == (2 if trace else 0)

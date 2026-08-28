@@ -115,7 +115,7 @@ def set_ascend_forward_context(
     device_metadata_executor=None,
     has_sinks=False,
     eplb_heat_collection_status: bool = False,
-    moe_comm_type_override: MoECommType | None = None,
+    moe_comm_token_count: int | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -150,15 +150,12 @@ def set_ascend_forward_context(
             draft_moe_quant_type = getattr(draft_model_config, "draft_moe_quant_type", QuantType.NONE)
         else:
             draft_moe_quant_type = QuantType.NONE
-        moe_comm_type = (
-            moe_comm_type_override
-            if moe_comm_type_override is not None
-            else select_moe_comm_method(
-                max_num_tokens,
-                vllm_config,
-                is_draft_model=is_draft_model,
-                draft_moe_quant_type=draft_moe_quant_type,
-            )
+        selection_num_tokens = max_num_tokens if moe_comm_token_count is None else moe_comm_token_count
+        moe_comm_type = select_moe_comm_method(
+            selection_num_tokens,
+            vllm_config,
+            is_draft_model=is_draft_model,
+            draft_moe_quant_type=draft_moe_quant_type,
         )
 
         forward_context.moe_comm_type = moe_comm_type
@@ -428,26 +425,6 @@ def select_moe_comm_method(
         draft_moe_quant_type,
     )
     return moe_comm_type
-
-
-def get_layered_prefill_moe_comm_override(
-    vllm_config: VllmConfig,
-    *,
-    executing_layered_subbatch: bool,
-) -> MoECommType | None:
-    """Return the Phase 1 MoE communicator override, if one is required.
-
-    Layered Prefill splits one externally visible step into Decode and Prefill
-    forwards.  For a real EP deployment both forwards must use the same eager
-    dispatcher, so the Phase 1 path pins them to AlltoAll.  TP-only MoE must
-    retain the regular AllGather path: the EP group can alias the TP group even
-    when expert parallelism is disabled, and checking group size alone would
-    incorrectly switch that configuration to an EP dispatcher.
-    """
-    parallel_config = vllm_config.parallel_config
-    if not executing_layered_subbatch or not getattr(parallel_config, "enable_expert_parallel", False):
-        return None
-    return MoECommType.ALLTOALL if get_ep_group().world_size > 1 else None
 
 
 class _ExtraForwardContextProxy:

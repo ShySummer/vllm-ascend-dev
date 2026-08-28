@@ -278,42 +278,6 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 
 
 @pytest.mark.parametrize(
-    ("executing_layered_subbatch", "enable_expert_parallel", "ep_world_size", "expected"),
-    [
-        (False, True, 4, None),
-        (True, False, 4, None),
-        (True, True, 1, None),
-        (True, True, 4, MoECommType.ALLTOALL),
-    ],
-)
-def test_layered_prefill_comm_override_distinguishes_tp_from_ep(
-    monkeypatch,
-    executing_layered_subbatch,
-    enable_expert_parallel,
-    ep_world_size,
-    expected,
-):
-    """TP-only MoE keeps AllGather; only an actual EP group uses AlltoAll."""
-    monkeypatch.setattr(
-        afc,
-        "get_ep_group",
-        lambda: SimpleNamespace(world_size=ep_world_size),
-    )
-    vllm_config = _make_vllm_config(
-        enable_expert_parallel=enable_expert_parallel,
-        tensor_parallel_size=4,
-    )
-
-    assert (
-        afc.get_layered_prefill_moe_comm_override(
-            vllm_config,
-            executing_layered_subbatch=executing_layered_subbatch,
-        )
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
         (128, MoECommType.MC2),
@@ -593,8 +557,9 @@ def test_set_ascend_forward_context_pins_current_vllm_config(monkeypatch, model_
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
-@pytest.mark.parametrize("override", [None, MoECommType.ALLTOALL])
-def test_forward_context_preserves_draft_routing_with_layered_override(monkeypatch, is_draft, override):
+@pytest.mark.parametrize("token_count", [None, 0, 128])
+@pytest.mark.parametrize("model_owned", [False, True])
+def test_forward_context_preserves_draft_routing_with_token_count(monkeypatch, is_draft, token_count, model_owned):
     from contextlib import nullcontext
 
     forward_context = SimpleNamespace(dp_metadata=None)
@@ -619,18 +584,25 @@ def test_forward_context_preserves_draft_routing_with_layered_override(monkeypat
         module_name,
         SimpleNamespace(get_moe_comm_method=lambda _t: method),
     )
+    model_method = object()
+    model = SimpleNamespace(moe_comm_methods={MoECommType.ALLGATHER: model_method}) if model_owned else None
     with afc.set_ascend_forward_context(
         None,
         config,
         num_tokens=3,
         is_draft_model=is_draft,
-        moe_comm_type_override=override,
+        moe_comm_token_count=token_count,
+        model_instance=model,
     ):
         expected_quant = draft_quant if is_draft else QuantType.NONE
         assert forward_context.draft_moe_quant_type is expected_quant
-        assert forward_context.moe_comm_type == (override if override is not None else MoECommType.ALLGATHER)
-        assert forward_context.moe_comm_method is method
-    if override is None:
-        selector.assert_called_once_with(3, config, is_draft_model=is_draft, draft_moe_quant_type=expected_quant)
-    else:
-        selector.assert_not_called()
+        assert forward_context.moe_comm_type == MoECommType.ALLGATHER
+        assert forward_context.moe_comm_method is (model_method if model_owned else method)
+        assert forward_context.num_tokens == 3
+        assert forward_context.padded_num_tokens == 3
+    selector.assert_called_once_with(
+        3 if token_count is None else token_count,
+        config,
+        is_draft_model=is_draft,
+        draft_moe_quant_type=expected_quant,
+    )
