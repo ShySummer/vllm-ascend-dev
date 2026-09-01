@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
 from vllm_ascend.worker import model_runner_v1 as runner_module
@@ -113,4 +114,61 @@ def test_layered_sample_uses_current_sampler_interface(monkeypatch, trace, lmhea
     args = sampler.call_args.kwargs
     assert args["sampling_metadata"] is metadata
     torch.testing.assert_close(args["logits"], logits[:2] if lmhead_tp else logits)
-    assert log.info.call_count == (2 if trace else 0)
+    log.info.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_prefill", [False, True])
+def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail_prefill):
+    synchronize = MagicMock()
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=synchronize), raising=False)
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"d": 1, "p": 3}
+    output.total_num_scheduled_tokens = 4
+    output.layered_prefill_plan = SimpleNamespace(prefill_req_ids=["p"])
+    output.finished_req_ids = {"finished"}
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    main_batch = SimpleNamespace(remove_request=MagicMock())
+    prefill_batch = SimpleNamespace(remove_request=MagicMock())
+    runner.input_batch = main_batch
+    runner.get_model = lambda: SimpleNamespace(supports_layered_prefill=True)
+    runner._get_layered_prefill_input_batch = lambda _n: prefill_batch
+    runner._capture_layered_sampling_masks = lambda: ([], 0, [])
+    calls = []
+
+    def execute(sub_output, intermediate):
+        is_prefill = sub_output.layered_prefill_plan is not None
+        calls.append(
+            (
+                runner._layered_moe_comm_token_count,
+                sub_output.num_scheduled_tokens,
+                sub_output.finished_req_ids,
+            )
+        )
+        assert runner._executing_layered_subbatch
+        assert intermediate is None
+        if is_prefill and fail_prefill:
+            raise RuntimeError("mock prefill failure")
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.full(
+                    (sub_output.total_num_scheduled_tokens, 2),
+                    2.0 if is_prefill else 1.0,
+                )
+            }
+        )
+
+    runner.execute_model = execute
+    if fail_prefill:
+        with pytest.raises(RuntimeError, match="mock prefill failure"):
+            runner._execute_layered_step(output, None)
+    else:
+        packed = runner._execute_layered_step(output, None)
+        d_out, p_out = runner._split_layered_pp_intermediate(packed)
+        torch.testing.assert_close(d_out["hidden_states"], torch.ones(1, 2))
+        torch.testing.assert_close(p_out["hidden_states"], torch.full((3, 2), 2.0))
+    assert calls == [(None, {"d": 1}, {"finished"}), (4, {"p": 3}, set())]
+    assert runner.input_batch is main_batch
+    assert runner._layered_moe_comm_token_count is None
+    assert not runner._executing_layered_subbatch
+    prefill_batch.remove_request.assert_called_once_with("finished")
+    assert synchronize.call_count == (1 if fail_prefill else 2)
