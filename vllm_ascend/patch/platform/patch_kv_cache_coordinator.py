@@ -512,6 +512,8 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     # compatibility; platform validation guarantees that it is one.
     del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens)
+    if num_prefill_lookahead is None:
+        num_prefill_lookahead = 0
     hybrid_kwargs = dict(
         kv_cache_config=kv_cache_config,
         max_model_len=max_model_len,

@@ -367,3 +367,42 @@ def test_per_group_lookup_matches_scheduler_call_convention():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("lookahead", [None, 0, 4])
+@pytest.mark.parametrize("route", ["single", "hybrid", "deepseek", "private"])
+def test_coordinator_normalizes_lookahead_and_preserves_new_interface(monkeypatch, lookahead, route):
+    specs = [SimpleNamespace(cacheable=True)]
+    if route in ("hybrid", "private"):
+        specs.append(SimpleNamespace(cacheable=route != "private"))
+    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs])
+    calls = []
+    result = object()
+
+    def record(kind, **kwargs):
+        calls.append((kind, kwargs))
+        return result
+
+    monkeypatch.setattr(mod, "is_prefix_cacheable", lambda spec: spec.cacheable)
+    monkeypatch.setattr(mod, "_is_deepseek_v4_kv_cache_config", lambda _c: route == "deepseek")
+    monkeypatch.setattr(mod, "_orig_get_kv_cache_coordinator", lambda **kw: record("original", **kw))
+    monkeypatch.setattr(mod, "AscendHybridKVCacheCoordinator", lambda **kw: record("hybrid", **kw))
+    returned = mod.get_kv_cache_coordinator(
+        config,
+        max_model_len=2048,
+        max_in_flight_tokens=256,
+        scheduler_block_size=128,
+        num_prefill_lookahead=lookahead,
+        allow_partial_hash_hits=False,
+    )
+    assert returned is result
+    assert len(calls) == 1
+    kind, kwargs = calls[0]
+    assert kind == ("original" if route == "single" else "hybrid")
+    assert kwargs["kv_cache_config"] is config
+    assert kwargs["num_prefill_lookahead"] == (0 if lookahead is None else lookahead)
+    assert kwargs["max_in_flight_tokens"] == 256
+    assert kwargs["scheduler_block_size"] == 128
+    assert kwargs["allow_partial_hash_hits"] is False
+    assert kwargs["pcp_world_size"] == 1
+    assert "max_num_batched_tokens" not in kwargs
