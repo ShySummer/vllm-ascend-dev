@@ -510,3 +510,37 @@ def test_upstream_scheduler_seams_still_exist():
         "all-reduce. It MUST be called every non-idle iteration by run_busy_loop "
         "(incl. dummy-batch) or the all_gather deadlocks."
     )
+
+
+@pytest.mark.parametrize(
+    "admit_new_prefills,separate_prefill_quota",
+    [(True, False), (True, True), (False, True)],
+)
+def test_balance_disabled_forwards_prefill_constraints(
+    admit_new_prefills, separate_prefill_quota
+):
+    scheduler = object.__new__(BalanceScheduler)
+    scheduler._balance_enabled = False
+    sentinel = object()
+    with patch.object(_UpstreamScheduler, "schedule", return_value=sentinel) as upstream:
+        result = scheduler.schedule(
+            True,
+            admit_new_prefills=admit_new_prefills,
+            separate_prefill_quota=separate_prefill_quota,
+        )
+    assert result is sentinel
+    if not admit_new_prefills or separate_prefill_quota:
+        upstream.assert_called_once_with(
+            True,
+            admit_new_prefills=admit_new_prefills,
+            separate_prefill_quota=separate_prefill_quota,
+        )
+    else:
+        upstream.assert_called_once_with(True)
+
+
+def test_balance_enabled_does_not_silently_drop_prefill_constraints():
+    scheduler = object.__new__(BalanceScheduler)
+    scheduler._balance_enabled = True
+    with pytest.raises(ValueError, match="cannot be combined"):
+        scheduler.schedule(separate_prefill_quota=True)
