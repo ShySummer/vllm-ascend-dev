@@ -16,9 +16,10 @@ deltas: (1) the disabled-path early return that delegates to ``super()``,
 (2) the ``balance_flag`` break inside the WAITING loop
 (``any-rank-at-cap => global freeze``), and (3) ``if request_queue is None:
 break`` in place of upstream's ``assert request_queue is not None`` (so a
-drained-rank schedule does not assert when balance defers admission). Both
-supported vLLM refs expose ``schedule(throttle_prefills=False)``, so the
-disabled fast path forwards that argument directly.
+drained-rank schedule does not assert when balance defers admission). The
+disabled fast path forwards Prefill admission constraints to upstream when
+supplied; the default call retains compatibility with the pinned release.
+The copied balance-enabled implementation does not support these constraints.
 
 The engine-core side is NOT copied: ``BalanceDPEngineCoreProc`` hooks
 ``_has_global_unfinished_reqs`` (called every iteration by upstream's
@@ -161,9 +162,26 @@ class BalanceScheduler(Scheduler):
         running_tensor = torch.tensor([len(self.running)], dtype=torch.int, device="cpu")
         dist.all_gather(self.balance_queue, running_tensor, group=self.dp_group)
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(
+        self,
+        throttle_prefills: bool = False,
+        *,
+        admit_new_prefills: bool = True,
+        separate_prefill_quota: bool = False,
+    ) -> SchedulerOutput:
         if not self._balance_enabled:
+            if not admit_new_prefills or separate_prefill_quota:
+                return super().schedule(
+                    throttle_prefills,
+                    admit_new_prefills=admit_new_prefills,
+                    separate_prefill_quota=separate_prefill_quota,
+                )
             return super().schedule(throttle_prefills)
+        if not admit_new_prefills or separate_prefill_quota:
+            raise ValueError(
+                "Prefill admission cannot be combined with "
+                "enable_balance_scheduling=True."
+            )
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
