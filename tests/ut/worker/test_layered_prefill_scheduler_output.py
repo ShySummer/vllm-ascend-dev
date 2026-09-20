@@ -138,6 +138,7 @@ def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail
     prefill_batch = SimpleNamespace(remove_request=MagicMock())
     runner.input_batch = main_batch
     runner.layered_prefill_model_adapter = object()
+    runner.speculative_config = None
     runner._get_layered_prefill_input_batch = lambda _n: prefill_batch
     runner._capture_layered_sampling_masks = lambda: ([], 0, [])
     calls = []
