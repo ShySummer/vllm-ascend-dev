@@ -1668,6 +1668,7 @@ class SchedulerConfig:
             require_eager=bool(layered_prefill_raw.get("require_eager", True)),
             single_forward=bool(layered_prefill_raw.get("single_forward", True)),
             single_forward_decode_graph=bool(layered_prefill_raw.get("single_forward_decode_graph", True)),
+            single_forward_compile=bool(layered_prefill_raw.get("single_forward_compile", True)),
         )
 
         def _resolve(config_key: str, default: Any) -> Any:
