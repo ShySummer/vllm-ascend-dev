@@ -245,6 +245,9 @@ from vllm_ascend.worker.device_metadata import (
     DeviceMetadataTaskProvider,
 )
 from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+from vllm_ascend.worker.layered_prefill_single_forward import (
+    LayeredPrefillSingleForward,
+)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.utils import (
     AscendKVBlockZeroer,
@@ -2943,9 +2946,20 @@ class NPUModelRunner(GPUModelRunner):
         preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", ())
         if preempted_req_ids and layered_state is not None:
             layered_state.clear_many(preempted_req_ids)
-        if layered_plan is not None and not self._executing_layered_subbatch:
+        single_forward = (
+            layered_plan is not None
+            and not self._executing_layered_subbatch
+            and self.ascend_config.scheduler_config.layered_prefill_config.single_forward
+            and LayeredPrefillSingleForward.supported(self)
+        )
+        layered_batch = None
+        if (
+            layered_plan is not None
+            and not self._executing_layered_subbatch
+            and not single_forward
+        ):
             return self._execute_layered_step(scheduler_output, intermediate_tensors)
-        if layered_plan is not None:
+        if layered_plan is not None and not single_forward:
             if set(scheduler_output.num_scheduled_tokens) != set(layered_plan.prefill_req_ids):
                 # The layered subbatch intentionally contains only P rows.
                 # The outer D view is validated by _execute_layered_step.
@@ -3225,6 +3239,14 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                if single_forward:
+                    executor = getattr(self, "_layered_single_forward_executor", None)
+                    if executor is None:
+                        executor = LayeredPrefillSingleForward(self)
+                        self._layered_single_forward_executor = executor
+                    layered_batch = executor.prepare(layered_plan, num_tokens_padded)
+                    logger.info_once("Layered Prefill: single mixed D/P forward enabled")
+
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -3239,6 +3261,7 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     cudagraph_runtime_mode=cudagraph_mode,
                     batch_descriptor=batch_desc,
+                    layered_batch=layered_batch,
                 )
 
                 self._sanitize_placeholder_input_ids_for_forward(
@@ -3330,7 +3353,11 @@ class NPUModelRunner(GPUModelRunner):
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
-            if layered_plan is None:
+            if layered_batch is not None:
+                hidden_states = layered_batch.forward(
+                    input_ids, positions, inputs_embeds, attn_metadata,
+                )
+            elif layered_plan is None:
                 hidden_states = self._model_forward(
                     num_tokens_padded,
                     input_ids,
@@ -3451,6 +3478,11 @@ class NPUModelRunner(GPUModelRunner):
             active_device_metadata_executor.release()
         self.kvpp.complete_forward()
 
+        skip_layered_sampling = (
+            layered_plan is not None
+            and not layered_plan.is_sampling_step
+            and (layered_batch is None or layered_batch.d_tokens == 0)
+        )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and layered_plan is None:
@@ -3488,7 +3520,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._finalize_dump_data()
                     return output
 
-                if layered_plan is not None and not layered_plan.is_sampling_step:
+                if skip_layered_sampling:
                     sample_hidden_states = hidden_states[:0]
                     logits = None
                 else:
@@ -3500,12 +3532,12 @@ class NPUModelRunner(GPUModelRunner):
 
                 if not get_pp_group().is_last_rank:
                     sample_hidden_states = hidden_states[:0] if (
-                        layered_plan is not None and not layered_plan.is_sampling_step
+                        skip_layered_sampling
                     ) else hidden_states[logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    if layered_plan is not None and not layered_plan.is_sampling_step:
+                    if skip_layered_sampling:
                         sample_hidden_states = hidden_states[:0]
                         logits = None
                     else:
@@ -3535,7 +3567,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
-                layered_plan is not None and not layered_plan.is_sampling_step,
+                skip_layered_sampling,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -4362,6 +4394,7 @@ class NPUModelRunner(GPUModelRunner):
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         batch_descriptor: BatchDescriptor | None = None,
         offload_dummy: bool = False,
+        layered_batch: Any = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -4613,9 +4646,14 @@ class NPUModelRunner(GPUModelRunner):
             common_v41_metadata: dict,
             common_v41_batch_metadata: dict,
             ubid: int | None = None,
+            layered_decode: bool = False,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
+            if layered_decode:
+                builder = layered_batch.executor.builder(
+                    kv_cache_gid, attn_gid, attn_group, builder,
+                )
             is_gdn_noop = skip_gdn_state_update and isinstance(
                 builder,
                 GDNAttentionMetadataBuilder,
@@ -4669,13 +4707,15 @@ class NPUModelRunner(GPUModelRunner):
                 if for_cudagraph_capture:
                     common_ratio_to_sas_metadata = {}
                 extra_attn_metadata_args = dict(
-                    num_actual_reqs=num_reqs,
+                    num_actual_reqs=(
+                        layered_batch.d_tokens if layered_decode else num_reqs
+                    ),
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
             elif isinstance(builder, v41_metadata_builder_type):
                 extra_attn_metadata_args = dict(
-                    num_actual_reqs=num_reqs,
+                    num_actual_reqs=(layered_batch.d_tokens if layered_decode else num_reqs),
                     skip_ring_state_update=skip_gdn_state_update,
                     common_v41_metadata=common_v41_metadata,
                     common_v41_batch_metadata=common_v41_batch_metadata,
@@ -4701,7 +4741,9 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(builder, AscendDSAMetadataBuilder):
                 common_ratio_to_sas_metadata = builder.common_ratio_to_sas_metadata  # type: ignore[assignment]
 
-            if ubid is None:
+            if layered_decode:
+                attn_metadata_dict = layered_batch.decode_metadata
+            elif ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
             else:
@@ -4715,12 +4757,14 @@ class NPUModelRunner(GPUModelRunner):
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_v41_batch_metadata: dict[str, Any] = {}
+        decode_v41_batch_metadata: dict[str, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             # V4.1 cache coordinates are shared only inside one framework KV
             # cache group. This lets a source's LongKV and Indexer reuse the
             # same [T, 2] mapping without aliasing any SWA group's mapping.
             common_v41_metadata: dict[str, Any] = {}
+            decode_v41_metadata: dict[str, Any] = {}
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -4766,6 +4810,10 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            decode_cm = (
+                layered_batch.compact_metadata(cm)
+                if layered_batch is not None and layered_batch.d_tokens else None
+            )
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 _build_attn_group_metadata(
                     kv_cache_gid,
@@ -4775,6 +4823,13 @@ class NPUModelRunner(GPUModelRunner):
                     common_v41_metadata,
                     common_v41_batch_metadata,
                 )
+                if decode_cm is not None:
+                    _build_attn_group_metadata(
+                        kv_cache_gid, attn_gid, decode_cm,
+                        layered_batch.decode_ratios,
+                        decode_v41_metadata, decode_v41_batch_metadata,
+                        layered_decode=True,
+                    )
         if req_doc_ranges is not None:
             if isinstance(attn_metadata, list):
                 for ub_metadata in attn_metadata:
@@ -5506,6 +5561,8 @@ class NPUModelRunner(GPUModelRunner):
         # KV-cache initialization can replace the main input batch and its
         # block-table layout.  Never retain a P view across that boundary.
         self.layered_prefill_input_batch = None
+        # Decode graph bindings also reference this KV-cache allocation.
+        self._layered_single_forward_executor = None
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
