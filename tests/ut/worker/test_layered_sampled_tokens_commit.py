@@ -5,6 +5,8 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.v1.core.layered_prefill import LayeredPrefillPlan, LayeredPrefillStateStore
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -75,3 +77,41 @@ def test_commit_tolerates_missing_request_state(requests):
     runner = _make_runner(requests)
 
     runner._commit_layered_sampled_tokens(_output("req", 0, [[42]]))
+
+def test_layered_frontiers_follow_request_ids_and_ignore_padding():
+    runner = object.__new__(NPUModelRunner)
+    runner.layered_prefill_state = LayeredPrefillStateStore()
+    plan = LayeredPrefillPlan(
+        version=1,
+        cohort_id=0,
+        group_id=0,
+        num_groups=2,
+        group_start=0,
+        group_end=1,
+        prefill_req_ids=("a", "b"),
+        query_tokens={"a": 2, "b": 3},
+        commit_tokens={"a": 0, "b": 0},
+    )
+    hidden = torch.arange(10).reshape(5, 2)
+    residual = hidden + 20
+    runner._save_layered_frontiers(
+        plan, ["a", "b"], SimpleNamespace(hidden_states=hidden, residual=residual)
+    )
+    hidden.zero_()
+    residual.zero_()
+
+    next_plan = SimpleNamespace(group_id=1, query_tokens=plan.query_tokens)
+    packed_hidden, packed_residual = runner._load_layered_frontiers(
+        next_plan, ["b", "a"], 7
+    )
+    assert packed_hidden.tolist() == [
+        [4, 5], [6, 7], [8, 9], [0, 1], [2, 3], [0, 0], [0, 0]
+    ]
+    assert packed_residual.tolist() == [
+        [24, 25], [26, 27], [28, 29], [20, 21], [22, 23], [0, 0], [0, 0]
+    ]
+
+    final_plan = SimpleNamespace(is_final_group=True)
+    runner._save_layered_frontiers(final_plan, ["b", "a"], None)
+    assert runner.layered_prefill_state.get("a") is None
+    assert runner.layered_prefill_state.get("b") is None

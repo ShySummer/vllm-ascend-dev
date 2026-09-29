@@ -76,6 +76,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.layered_prefill import (
+    LayeredForwardOutput,
     LayeredFrontier,
     LayeredPrefillStateStore,
 )
@@ -2075,6 +2076,76 @@ class NPUModelRunner(GPUModelRunner):
             self.discard_request_mask.np[:num_reqs] = mask
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
+    def _load_layered_frontiers(
+        self, plan: Any, req_ids: list[str], num_tokens_padded: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        hidden_parts = []
+        residual_parts = []
+        for req_id in req_ids:
+            frontier = self.layered_prefill_state.get(req_id)
+            if frontier is None:
+                raise RuntimeError(
+                    f"Missing layered activation frontier for request {req_id}"
+                )
+            query_len = plan.query_tokens[req_id]
+            if (
+                frontier.group_id != plan.group_id
+                or frontier.query_len != query_len
+                or frontier.hidden_states.shape[0] != query_len
+                or (
+                    frontier.residual is not None
+                    and frontier.residual.shape[0] != query_len
+                )
+            ):
+                raise RuntimeError(f"Layered frontier mismatch for request {req_id}")
+            hidden_parts.append(frontier.hidden_states)
+            residual_parts.append(frontier.residual)
+        if any(part is None for part in residual_parts) and not all(
+            part is None for part in residual_parts
+        ):
+            raise RuntimeError("Layered frontier residual layout mismatch")
+        hidden = torch.cat(hidden_parts)
+        residual = (
+            torch.cat(residual_parts)
+            if residual_parts[0] is not None else None
+        )
+        padding = num_tokens_padded - hidden.shape[0]
+        if padding < 0:
+            raise RuntimeError("Layered frontier exceeds the P batch")
+        if padding:
+            hidden = torch.cat((hidden, hidden.new_zeros(
+                (padding, *hidden.shape[1:])
+            )))
+            if residual is not None:
+                residual = torch.cat((residual, residual.new_zeros(
+                    (padding, *residual.shape[1:])
+                )))
+        return hidden, residual
+
+    def _save_layered_frontiers(
+        self, plan: Any, req_ids: list[str], output: LayeredForwardOutput
+    ) -> None:
+        if plan.is_final_group:
+            self.layered_prefill_state.clear_many(req_ids)
+            return
+        offset = 0
+        for req_id in req_ids:
+            query_len = plan.query_tokens[req_id]
+            next_offset = offset + query_len
+            self.layered_prefill_state.put(
+                LayeredFrontier(
+                    req_id=req_id,
+                    group_id=plan.group_id + 1,
+                    query_len=query_len,
+                    hidden_states=output.hidden_states[offset:next_offset].clone(),
+                    residual=(
+                        output.residual[offset:next_offset].clone()
+                        if output.residual is not None else None
+                    ),
+                )
+            )
+            offset = next_offset
+
     def _execute_layered_step(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2090,17 +2161,15 @@ class NPUModelRunner(GPUModelRunner):
             )
         all_req_ids = list(scheduler_output.num_scheduled_tokens)
         p_req_ids = list(plan.prefill_req_ids)
-        if len(p_req_ids) != 1:
-            raise RuntimeError(
-                "Layered prefill Phase 1 supports exactly one P request"
-            )
         p_req_set = set(p_req_ids)
         if not p_req_set.issubset(all_req_ids):
             raise RuntimeError("Layered plan contains an unscheduled P request")
         d_req_ids = [req_id for req_id in all_req_ids if req_id not in p_req_set]
         main_input_batch = self.input_batch
         main_sampling_masks = self._capture_layered_sampling_masks()
-        p_input_batch = self._get_layered_prefill_input_batch(len(p_req_ids))
+        p_input_batch = self._get_layered_prefill_input_batch(
+            getattr(main_input_batch, "max_num_reqs", len(p_req_ids))
+        )
         sub_batches: list[LayeredSubBatchState] = []
         pp_intermediates: list[IntermediateTensors] = []
 
@@ -3275,40 +3344,28 @@ class NPUModelRunner(GPUModelRunner):
                 # may be padded while scheduler_output keeps the logical prompt
                 # length. Padding rows are excluded from attention/KV commit.
                 self._set_layered_prefill_moe_layer_offset(layered_plan.group_start)
-                req_id = layered_plan.prefill_req_ids[0]
-                frontier = self.layered_prefill_state.get(req_id)
+                req_ids = self.input_batch.req_ids
+                if set(req_ids) != set(layered_plan.prefill_req_ids):
+                    raise RuntimeError("Layered P batch does not match the plan")
+                frontiers = [self.layered_prefill_state.get(req_id) for req_id in req_ids]
                 pp = get_pp_group()
                 owner = self._layered_pp_group_owner(layered_plan)
                 owner_has_frontier = (
                     layered_plan.group_id > 0 and pp.rank_in_group == owner
                 )
                 if owner_has_frontier:
-                    if frontier is None:
-                        raise RuntimeError(
-                            f"Missing layered activation frontier for request {req_id}"
-                        )
-                    if frontier.group_id != layered_plan.group_id:
-                        raise RuntimeError(
-                            f"Layered frontier group mismatch for {req_id}: expected "
-                            f"{layered_plan.group_id}, got {frontier.group_id}"
-                        )
-                    frontier_tuple = (frontier.hidden_states, frontier.residual)
+                    frontier_tuple = self._load_layered_frontiers(
+                        layered_plan, req_ids, num_tokens_padded
+                    )
                     initial_inputs_embeds = None
                 else:
-                    if frontier is not None and pp.rank_in_group == owner:
-                        raise RuntimeError(
-                            f"Unexpected layered frontier for group 0 request {req_id}"
-                        )
+                    if (pp.rank_in_group == owner
+                            and any(frontier is not None for frontier in frontiers)):
+                        raise RuntimeError("Unexpected layered frontier for group 0")
                     frontier_tuple = None
                     if layered_plan.group_id == 0 and pp.rank_in_group == 0:
-                        # The first stage owns the embedding operation.  It is
-                        # transported through earlier no-op stages until the
-                        # stage owning group 0 consumes it.
                         initial_inputs_embeds = inputs_embeds
                     elif pp.rank_in_group < owner and layered_plan.group_id > 0:
-                        # Before the owner stage P rows are transport-only.
-                        # Construct the model's normal PP state shape instead
-                        # of assuming a two-dimensional residual stream.
                         frontier_tuple = layered_adapter.make_transport_frontier(
                             num_tokens_padded,
                             self.model_config.dtype,
@@ -3343,29 +3400,9 @@ class NPUModelRunner(GPUModelRunner):
                         "Layered model final-layer status does not match the plan"
                     )
                 hidden_states = layered_output.hidden_states
-                if layered_plan.is_final_group:
-                    self.layered_prefill_state.clear(req_id)
-                else:
-                    # Keep the frontier independent from model/attention
-                    # workspaces that the next Decode sub-forward may reuse.
-                    # This is the Phase 1 correctness path; later optimized
-                    # runners can replace the clone with a managed frontier
-                    # pool once aliasing is proven safe.
-                    frontier_hidden = layered_output.hidden_states.clone()
-                    frontier_residual = (
-                        layered_output.residual.clone()
-                        if layered_output.residual is not None
-                        else None
-                    )
-                    self.layered_prefill_state.put(
-                        LayeredFrontier(
-                            req_id=req_id,
-                            group_id=layered_plan.group_id + 1,
-                            query_len=layered_plan.query_tokens[req_id],
-                            hidden_states=frontier_hidden,
-                            residual=frontier_residual,
-                        )
-                    )
+                self._save_layered_frontiers(
+                    layered_plan, req_ids, layered_output
+                )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs and layered_plan is None:
