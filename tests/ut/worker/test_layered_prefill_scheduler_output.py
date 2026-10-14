@@ -120,7 +120,14 @@ def test_layered_sample_uses_current_sampler_interface(monkeypatch, trace, lmhea
 @pytest.mark.parametrize("fail_prefill", [False, True])
 def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail_prefill):
     synchronize = MagicMock()
-    monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=synchronize), raising=False)
+    device_sync = MagicMock(side_effect=AssertionError("device-wide sync forbidden"))
+    stream = SimpleNamespace(synchronize=synchronize)
+    monkeypatch.setattr(
+        torch,
+        "npu",
+        SimpleNamespace(current_stream=lambda: stream, synchronize=device_sync),
+        raising=False,
+    )
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {"d": 1, "p": 3}
     output.total_num_scheduled_tokens = 4
@@ -131,6 +138,7 @@ def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail
     prefill_batch = SimpleNamespace(remove_request=MagicMock())
     runner.input_batch = main_batch
     runner.layered_prefill_model_adapter = object()
+    runner.speculative_config = None
     runner._get_layered_prefill_input_batch = lambda _n: prefill_batch
     runner._capture_layered_sampling_masks = lambda: ([], 0, [])
     calls = []
@@ -172,3 +180,4 @@ def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail
     assert not runner._executing_layered_subbatch
     prefill_batch.remove_request.assert_called_once_with("finished")
     assert synchronize.call_count == (1 if fail_prefill else 2)
+    device_sync.assert_not_called()
