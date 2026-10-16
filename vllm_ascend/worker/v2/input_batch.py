@@ -69,6 +69,26 @@ class AscendInputBuffers(InputBuffers):
         self.profile_cpp: bool = False
 
 
+def _field_values(input_batch: InputBatch) -> dict:
+    """Field values of ``input_batch``, by reference.
+
+    ``dataclasses.asdict`` must not be used here. Its leaf branch is
+    ``copy.deepcopy(obj)``, and ``torch.Tensor.__deepcopy__`` allocates new
+    storage, so every tensor field comes back detached from the buffer it was
+    sliced from.
+
+    ``InputBatch.make_dummy`` deliberately returns slices of the persistent
+    ``InputBuffers`` (``input_buffers.seq_lens[:num_reqs]`` and friends) so that
+    the address an aclgraph bakes at capture is the same address the runtime
+    writes to on every replay. Copying the tensors breaks that invariant: the
+    captured graph reads a throwaway allocation that nothing ever updates
+    again. Backends whose ``update_graph_params`` rebinds the kernel arguments
+    hide the damage; DSA's is a no-op, so it reads stale lengths and derives
+    out-of-range KV addresses from them.
+    """
+    return {f.name: getattr(input_batch, f.name) for f in fields(input_batch)}
+
+
 @dataclass
 class AscendInputBatch(InputBatch):
     """Input batch for Ascend NPUs."""
@@ -152,7 +172,7 @@ class AscendInputBatch(InputBatch):
         if is_cpp_profile:
             cls._prepare_cpp_profile_dummy(input_batch, input_buffers, num_tokens)
         update_cos_sin(input_batch.positions)
-        base_fields = {field.name: getattr(input_batch, field.name) for field in fields(InputBatch)}
+        base_fields = _field_values(input_batch)
         return cls(
             **base_fields,
             seq_lens_np=seq_lens_np,

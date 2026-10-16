@@ -185,6 +185,7 @@ class AscendModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
         ubatch_idx: int = 0,
+        num_input_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
         # vLLM #50945 adds this contract; Ascend still disables DBO.
@@ -202,9 +203,12 @@ class AscendModelState(DefaultModelState):
             or (cudagraph_mode == CUDAGraphMode.PIECEWISE and input_batch.is_dummy)
         ):
             # Token-shaped metadata must match the padded model inputs.
-            num_input_tokens = input_batch.num_tokens_after_padding
+            resolved_num_input_tokens = input_batch.num_tokens_after_padding
         else:
-            num_input_tokens = input_batch.num_tokens
+            resolved_num_input_tokens = input_batch.num_tokens
+
+        if num_input_tokens is None:
+            num_input_tokens = resolved_num_input_tokens
 
         num_actual_reqs = input_batch.num_reqs
         num_actual_tokens = input_batch.num_tokens

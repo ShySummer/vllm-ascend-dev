@@ -569,8 +569,9 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
@@ -1615,6 +1616,47 @@ class DyntraLBConfig:
         return self
 
 
+@dataclasses.dataclass
+class LayeredPrefillExtensions:
+    """Ascend-side keys of ``scheduler_config["layered_prefill_config"]``.
+
+    vLLM's frozen ``LayeredPrefillConfig`` has no field for these, so they are
+    read from the same raw dict and consumed by the Ascend scheduler patch.
+    """
+
+    max_concurrent_layered_prefills: int = 1
+    skip_relay_stages: bool = False
+
+    def __init__(self, user_config: dict | None = None):
+        source = user_config or {}
+        # Layered prompts allowed in the layer pipeline at once.  A layer
+        # group runs on exactly one PP stage, so values above
+        # pipeline_parallel_size are clamped by the scheduler.
+        self.max_concurrent_layered_prefills = int(source.get("max_concurrent_layered_prefills", 1) or 1)
+        # PP stages with no work in the active layer group hand the
+        # activation on instead of running the layer-group machinery.
+        self.skip_relay_stages = bool(source.get("skip_relay_stages", False))
+        self._validate_config()
+
+    def _validate_config(self):
+        if self.max_concurrent_layered_prefills < 1:
+            raise ValueError(
+                "layered_prefill_config.max_concurrent_layered_prefills must be >= 1; "
+                f"got {self.max_concurrent_layered_prefills}"
+            )
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config: Any) -> "LayeredPrefillExtensions":
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        if not isinstance(additional_config, dict):
+            return cls()
+        scheduler_config = additional_config.get("scheduler_config") or {}
+        if not isinstance(scheduler_config, dict):
+            return cls()
+        raw = scheduler_config.get("layered_prefill_config") or {}
+        return cls(raw if isinstance(raw, dict) else None)
+
+
 @config
 class SchedulerConfig:
     """Configuration object for ``additional_config["scheduler_config"]``.
@@ -1633,6 +1675,7 @@ class SchedulerConfig:
     profiling_chunk_config: ProfilingChunkConfig = dataclasses.field(default_factory=ProfilingChunkConfig)
     batch_job_sched_config: BatchJobSchedConfig = dataclasses.field(default_factory=BatchJobSchedConfig)
     dyntra_lb_config: DyntraLBConfig = dataclasses.field(default_factory=DyntraLBConfig)
+    layered_prefill_extensions: LayeredPrefillExtensions = dataclasses.field(default_factory=LayeredPrefillExtensions)
     layered_prefill_config: LayeredPrefillConfig = dataclasses.field(default_factory=LayeredPrefillConfig)
 
     @classmethod
@@ -1653,9 +1696,7 @@ class SchedulerConfig:
                 "additional_config.scheduler_config.layered_prefill_config "
                 f"must be a dict, got {type(layered_prefill_raw).__name__}"
             )
-        allowed_num_groups = layered_prefill_raw.get(
-            "allowed_num_groups", (1, 2, 4, 8, 16)
-        )
+        allowed_num_groups = layered_prefill_raw.get("allowed_num_groups", (1, 2, 4, 8, 16))
         if allowed_num_groups is None:
             allowed_num_groups = (1, 2, 4, 8, 16)
         layered_prefill_config = LayeredPrefillConfig(
@@ -1666,10 +1707,15 @@ class SchedulerConfig:
             max_groups_per_step=int(layered_prefill_raw.get("max_groups_per_step", 1)),
             require_pd_mixed=bool(layered_prefill_raw.get("require_pd_mixed", True)),
             require_eager=bool(layered_prefill_raw.get("require_eager", True)),
+            fuse_mixed_batch=bool(layered_prefill_raw.get("fuse_mixed_batch", False)),
+            same_layer_batch=bool(layered_prefill_raw.get("same_layer_batch", False)),
             single_forward=bool(layered_prefill_raw.get("single_forward", True)),
             single_forward_decode_graph=bool(layered_prefill_raw.get("single_forward_decode_graph", True)),
             single_forward_compile=bool(layered_prefill_raw.get("single_forward_compile", True)),
+            p_group_decode_budget_ms=float(layered_prefill_raw.get("p_group_decode_budget_ms", 0.0) or 0.0),
+            max_chunk_tokens=int(layered_prefill_raw.get("max_chunk_tokens", 0) or 0),
         )
+        layered_prefill_extensions = LayeredPrefillExtensions(layered_prefill_raw)
 
         def _resolve(config_key: str, default: Any) -> Any:
             if config_key in scheduler_config:
@@ -1701,6 +1747,7 @@ class SchedulerConfig:
             "batch_job_sched_config": _resolve("batch_job_sched_config", {}),
             "dyntra_lb_config": scheduler_config.get("dyntra_lb_config", {}),
             "layered_prefill_config": layered_prefill_config,
+            "layered_prefill_extensions": layered_prefill_extensions,
         }
         # Forward nested unknown keys to pydantic so extra="forbid" reports
         # typos instead of the resolver silently dropping them.

@@ -358,6 +358,35 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _zero_graph_padding_rows(self, num_reqs: int, num_actual_reqs: int | None) -> int:
+        """Clear dummy FULL-graph / FIA pad rows so CP does not read stale KV.
+
+        ``num_reqs`` is the padded request count used by the graph; ``num_actual_reqs``
+        is the real batch.  Padding rows keep leftover ``seq_lens`` / ``block_table``
+        from the previous step; DSA-CP then shards those tokens onto other TP ranks
+        and the kernel MTE-faults (507011).
+        """
+        if num_actual_reqs is None:
+            return num_reqs
+        num_actual_reqs = min(int(num_actual_reqs), num_reqs)
+        if num_actual_reqs >= num_reqs:
+            return num_actual_reqs
+        seq_lens = getattr(self, "seq_lens", None)
+        if seq_lens is not None and seq_lens.shape[0] > num_actual_reqs:
+            seq_lens[num_actual_reqs:num_reqs].fill_(0)
+        seq_lens_cpu = getattr(self, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            end = min(num_reqs, int(seq_lens_cpu.shape[0]))
+            if num_actual_reqs < end:
+                seq_lens_cpu[num_actual_reqs:end].fill_(0)
+        block_table = getattr(self, "block_table", None)
+        if block_table is not None and block_table.shape[0] > num_actual_reqs:
+            block_table[num_actual_reqs:num_reqs, ...].fill_(0)
+        start_pos = getattr(self, "start_pos_prefill", None)
+        if start_pos is not None:
+            start_pos[num_actual_reqs:].fill_(0)
+        return num_actual_reqs
+
     def build(
         self,
         common_prefix_len: int,
@@ -427,6 +456,7 @@ class AscendDSACPMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        num_actual_reqs = self._zero_graph_padding_rows(num_reqs, num_actual_reqs)
 
         req_metadata = self.build_req_metadata(
             common_attn_metadata,

@@ -1094,6 +1094,22 @@ class TestSparseKVOffloadConfig(TestBase):
 
 
 class TestSchedulerConfig(TestBase):
+    def test_layered_prefill_extensions_survive_pydantic_resolution(self):
+        cfg = SchedulerConfig.from_additional_config(
+            {
+                "scheduler_config": {
+                    "layered_prefill_config": {
+                        "enabled": True,
+                        "max_concurrent_layered_prefills": 2,
+                        "skip_relay_stages": True,
+                    }
+                }
+            }
+        )
+        assert cfg.layered_prefill_config.enabled
+        assert cfg.layered_prefill_extensions.max_concurrent_layered_prefills == 2
+        assert cfg.layered_prefill_extensions.skip_relay_stages
+
     def test_defaults(self):
         config = SchedulerConfig.from_additional_config({})
 

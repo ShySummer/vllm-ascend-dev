@@ -643,7 +643,14 @@ def build_attn_state(
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
     # Speculative decoding or splitfuse.
-    elif np.all(num_valid_tokens == 1) or vllm_config.scheduler_config.enable_chunked_prefill:
+    elif (
+        np.all(num_valid_tokens == 1)
+        or (
+            np.any(np.asarray(num_scheduled_tokens) > 1)
+            and np.any(seq_lens_np[:num_reqs] > np.asarray(num_scheduled_tokens))
+        )
+        or vllm_config.scheduler_config.enable_chunked_prefill
+    ):
         attn_state = AscendAttentionState.ChunkedPrefill
     else:
         attn_state = AscendAttentionState.PrefillCacheHit

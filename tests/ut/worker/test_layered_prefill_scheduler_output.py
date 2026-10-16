@@ -134,6 +134,7 @@ def test_layered_pp_subbatches_select_tokens_and_restore_state(monkeypatch, fail
     output.layered_prefill_plan = SimpleNamespace(prefill_req_ids=["p"])
     output.finished_req_ids = {"finished"}
     runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.requests = {"d": object(), "p": object()}
     main_batch = SimpleNamespace(remove_request=MagicMock())
     prefill_batch = SimpleNamespace(remove_request=MagicMock())
     runner.input_batch = main_batch
