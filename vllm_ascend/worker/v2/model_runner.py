@@ -342,6 +342,9 @@ class NPUModelRunner(GPUModelRunner):
         # must not share storage.  See layered_prefill_v2_migration_plan.md §3.1.
         layered_cfg = self.ascend_config.scheduler_config.layered_prefill_config
         self._layered_prefill_enabled = bool(layered_cfg.enabled)
+        self._boundary_prefill_enabled = self._layered_prefill_enabled and (
+            getattr(layered_cfg, "boundary_policy", "off") == "pp_transition"
+        )
         if self._layered_prefill_enabled and (
             getattr(layered_cfg, "fuse_mixed_batch", False) or getattr(layered_cfg, "same_layer_batch", False)
         ):
@@ -726,6 +729,12 @@ class NPUModelRunner(GPUModelRunner):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ):
+        if getattr(self, "_boundary_prefill_enabled", False) and not dummy_run and not is_profile:
+            # A cancelled/preempted boundary can return directly to native
+            # execution. Consume its cleanup on that step before the native
+            # lifecycle removes those IDs from subsequent scheduler outputs.
+            self.layered_prefill_state.clear_many(getattr(scheduler_output, "finished_req_ids", ()) or ())
+            self.layered_prefill_state.clear_many(getattr(scheduler_output, "preempted_req_ids", ()) or ())
         layered_plan = getattr(scheduler_output, "layered_prefill_plan", None)
         if layered_plan is not None and not dummy_run and not self._layered_prefill_v2_ready:
             raise NotImplementedError("Layered Prefill V2 model adapter is not ready")
@@ -2135,6 +2144,9 @@ class NPUModelRunner(GPUModelRunner):
           skipped ``kv_connector.post_forward`` would be missed.  Layered
           already rejects connectors; same reasoning, kept local.
         """
+        # Boundary steps retain the completion fence and the common lifecycle.
+        if getattr(layered_plan, "boundary_mode", None):
+            return None
         if not self._skip_relay_stages:
             return None
         if self.parallel_config.pipeline_parallel_size <= 1:
@@ -2163,7 +2175,7 @@ class NPUModelRunner(GPUModelRunner):
         the step for its stored frontier.
         """
         num_groups = int(layered_plan.num_groups)
-        next_group = int(layered_plan.group_id) + 1
+        next_group = int(getattr(layered_plan, "resume_group_id", layered_plan.group_id + 1))
         if next_group >= num_groups:
             return None
         num_layers = self._num_hidden_layers()
@@ -2270,6 +2282,16 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(raw_num_layers, int):
                 num_layers = int(raw_num_layers)
                 break
+        if getattr(plan, "boundary_mode", None):
+            # A boundary interval can traverse multiple stages in one step.
+            owners = [
+                rank
+                for rank, (start, end) in enumerate(self._layered_pp_partitions(num_layers, pp.world_size))
+                if max(start, plan.group_start) < min(end, plan.group_end)
+            ]
+            if not owners:
+                raise RuntimeError("Boundary interval has no local PP layers")
+            return owners[0] if len(owners) == 1 else -1
         if int(plan.group_start) == 0 and int(plan.group_end) >= num_layers:
             # Full-model range: every rank runs its own stage inside this step.
             return -1
@@ -2390,6 +2412,10 @@ class NPUModelRunner(GPUModelRunner):
             req_ids = list(layered_plan.prefill_req_ids)
         if not req_ids:
             raise RuntimeError("Layered Prefill activation has no request ids")
+        if getattr(layered_plan, "boundary_mode", None):
+            return self._prepare_boundary_p_activation(
+                layered_plan, req_ids, num_tokens_padded, inputs_embeds, intermediate_tensors
+            )
         pp = get_pp_group()
         owner = self._layered_pp_group_owner(layered_plan)
         if owner < 0:
@@ -2463,6 +2489,47 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_tensors if receives_pp_activation else None,
             source,
         )
+
+    def _prepare_boundary_p_activation(self, plan, req_ids, padded, embeds, received):
+        """Restore only the interval's entry; later stages consume this step's wire."""
+        adapter = self.layered_prefill_model_adapter
+        start = int(plan.group_start)
+        if start >= adapter.end_layer:
+            return (
+                req_ids,
+                adapter.make_transport_frontier(padded, self.model_config.dtype, self.device),
+                None,
+                None,
+                "transport_frontier",
+            )
+        if start < adapter.start_layer:
+            if received is None:
+                raise RuntimeError("Boundary stage requires this step's PP activation")
+            return req_ids, None, None, received, "pp_recv"
+        if start == 0:
+            if any(self.layered_prefill_state.get(req_id) is not None for req_id in req_ids):
+                raise RuntimeError("Unexpected boundary frontier at chunk entry")
+            return req_ids, None, embeds, None, "embed"
+        for req_id in req_ids:
+            frontier = self.layered_prefill_state.get(req_id)
+            if (
+                frontier is None
+                or frontier.group_id != plan.group_id
+                or frontier.query_len != plan.query_tokens[req_id]
+                or getattr(frontier, "cohort_id", None) != plan.cohort_id
+            ):
+                raise RuntimeError(f"Missing or mismatched boundary frontier for {req_id}")
+        if len(req_ids) == 1:
+            saved = self.layered_prefill_state.get(req_ids[0])
+            frontier = pad_activation_rows(saved.hidden_states, saved.residual, padded)
+        else:
+            frontier = concat_req_frontiers(
+                self.layered_prefill_state,
+                req_ids,
+                expected_group_id=plan.group_id,
+                num_tokens_padded=padded,
+            )
+        return req_ids, frontier, None, None, "frontier"
 
     @staticmethod
     def _layered_prefill_moe_layer_offset(all_moe_layers: list[str], layer_start: int) -> int:
@@ -2722,6 +2789,12 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = layered_output.hidden_states
         else:
             store_ids = batch_req_ids
+            if getattr(layered_plan, "boundary_mode", None):
+                # PP0's stage exit is not the global interval's frontier.
+                # Retain state only at the rank owning the next real layer.
+                if get_pp_group().rank_in_group != self._layered_next_group_owner(layered_plan):
+                    self.layered_prefill_state.clear_many(batch_req_ids)
+                    store_ids = []
             if store_ids:
                 store_req_frontiers(
                     self.layered_prefill_state,
@@ -2729,10 +2802,11 @@ class NPUModelRunner(GPUModelRunner):
                     np.array(input_batch.query_start_loc_np, copy=True),
                     layered_output.hidden_states,
                     layered_output.residual,
-                    layered_plan.group_id + 1,
+                    getattr(layered_plan, "resume_group_id", layered_plan.group_id + 1),
                     batch_req_ids=batch_req_ids,
                     keep_ids=store_ids,
                     reuse_existing=use_group_executor,
+                    cohort_id=layered_plan.cohort_id if getattr(layered_plan, "boundary_mode", None) else None,
                 )
             hidden_states = None
 

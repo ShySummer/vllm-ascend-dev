@@ -526,9 +526,8 @@ class NPUPlatform(Platform):
 
         from vllm.config.compilation import CUDAGraphMode
 
-        if (
-            vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and "libjemalloc" in os.environ.get("LD_PRELOAD", "")
+        if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and "libjemalloc" in os.environ.get(
+            "LD_PRELOAD", ""
         ):
             logger.warning(
                 "libjemalloc is present in LD_PRELOAD while cudagraph_mode=%s "
@@ -1062,125 +1061,76 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             model_config,
         )
         is_deepseek_v4 = any(
-            getattr(config, "model_type", None) == "deepseek_v4"
-            for config in config_candidates
-            if config is not None
+            getattr(config, "model_type", None) == "deepseek_v4" for config in config_candidates if config is not None
         )
         raw_num_hidden_layers = next(
             (
                 getattr(config, "num_hidden_layers", None)
                 for config in config_candidates
-                if config is not None
-                and getattr(config, "num_hidden_layers", None) is not None
+                if config is not None and getattr(config, "num_hidden_layers", None) is not None
             ),
             None,
         )
-        num_hidden_layers = (
-            int(raw_num_hidden_layers)
-            if isinstance(raw_num_hidden_layers, int)
-            else None
-        )
-        if (
-            num_hidden_layers is not None
-            and parallel_config.pipeline_parallel_size > num_hidden_layers
-        ):
-            raise ValueError(
-                "layered_prefill_config pipeline_parallel_size cannot exceed "
-                "the model layer count"
-            )
+        num_hidden_layers = int(raw_num_hidden_layers) if isinstance(raw_num_hidden_layers, int) else None
+        if num_hidden_layers is not None and parallel_config.pipeline_parallel_size > num_hidden_layers:
+            raise ValueError("layered_prefill_config pipeline_parallel_size cannot exceed the model layer count")
         # Layered Prefill executes the Decode and Prefill views as separate
         # forwards.  Every TP rank therefore enters the same layer loop and
         # its existing TP collectives remain ordered.  TP>1 is supported;
         # when EP is enabled, the Ascend AlltoAll path restores the physical
         # TP token split after vLLM collapses routed-expert TP to one.
-        # PP>1 uses a stage-aligned global layer plan and transports D/P rows in
-        # one message per step.  Async scheduling stays supported only while
-        # the engine keeps at most one execute in flight per worker (V1 runner
-        # with PP=1); async PP broadcasts sampled tokens through a GPU ring
-        # that the layered one-send-per-step payload does not join, so the
-        # combination below stays rejected.  DBO remains disabled because it
-        # introduces multiple in-flight frontiers.
-        # sequence parallelism is still rejected below because it changes the
-        # frontier/token-row layout.  DP remains restricted to one rank until
-        # the scheduler plan is synchronized across DP/EP ranks.
-        if getattr(vllm_config, "use_v2_model_runner", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires the V1 model runner"
-            )
-        if (
-            vllm_config.scheduler_config.async_scheduling
-            and parallel_config.pipeline_parallel_size > 1
-        ):
-            raise ValueError(
-                "layered_prefill_config does not support async_scheduling "
-                "with pipeline_parallel_size > 1"
-            )
+        # Both runner generations transport D/P rows in one PP message per
+        # step. MRV2 additionally merges D and final-P sampling into one
+        # PPHandler slot; intermediate P groups do not sample. Boundary plans
+        # can span stages and each runner executes only its local intersection.
+        # Keep async PP, DBO and distributed/context-parallel gates below:
+        # admitting MRV2 does not enable those independent capabilities.
+        if vllm_config.scheduler_config.async_scheduling and parallel_config.pipeline_parallel_size > 1:
+            raise ValueError("layered_prefill_config does not support async_scheduling with pipeline_parallel_size > 1")
         if getattr(parallel_config, "enable_dbo", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support DBO"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support DBO")
         if (
             getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
             or getattr(parallel_config, "decode_context_parallel_size", 1) > 1
         ):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support context parallelism"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support context parallelism")
         if getattr(parallel_config, "data_parallel_size", 1) != 1:
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires data_parallel_size=1"
-            )
+            raise ValueError("layered_prefill_config Phase 1 requires data_parallel_size=1")
         if enable_sp(vllm_config):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support sequence-parallel MoE"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support sequence-parallel MoE")
         if getattr(parallel_config, "enable_eplb", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support upstream EPLB"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support upstream EPLB")
         enforce_eager = getattr(vllm_config.model_config, "enforce_eager", False)
         require_eager = getattr(layered_prefill_config, "require_eager", True)
         if require_eager and not enforce_eager:
-            raise ValueError(
-                "layered_prefill_config requires enforce_eager=True when "
-                "require_eager=True"
-            )
+            raise ValueError("layered_prefill_config requires enforce_eager=True when require_eager=True")
         if getattr(cache_config, "kv_offloading_size", None) is not None:
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support KV offloading"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support KV offloading")
         if getattr(
             getattr(ascend_config, "sparse_kv_offload_config", None),
             "enabled",
             False,
         ):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support sparse KV offload"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support sparse KV offload")
         if getattr(cache_config, "mamba_cache_mode", "none") != "none":
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support Mamba/hybrid KV state"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support Mamba/hybrid KV state")
         compilation_config = getattr(vllm_config, "compilation_config", None)
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
         cudagraph_mode_name = getattr(cudagraph_mode, "name", None)
-        allowed_cudagraph_modes = (
-            (None, "NONE")
-            if enforce_eager
-            else (None, "NONE", "FULL_DECODE_ONLY")
-        )
+        allowed_cudagraph_modes = (None, "NONE") if enforce_eager else (None, "NONE", "FULL_DECODE_ONLY")
         if cudagraph_mode_name not in allowed_cudagraph_modes:
             raise ValueError(
                 "layered_prefill_config supports cudagraph_mode=NONE or "
-                "FULL_DECODE_ONLY; Prefill layer groups remain eager"
+                "FULL_DECODE_ONLY; Prefill groups use their separate layer-range executor"
             )
         compilation_mode = getattr(compilation_config, "mode", None)
         compilation_mode_name = getattr(compilation_mode, "name", None)
         if cudagraph_mode_name == "FULL_DECODE_ONLY":
             # vLLM represents the standard Ascend full Decode graph setup as
             # VLLM_COMPILE + FULL_DECODE_ONLY. The partial-layer P call bypasses
-            # the wrapped full-model forward and is forced eager in the runner.
-            # Compilation also initializes the attention graph workspaces.
+            # the wrapped full-model forward; its range executor separately
+            # chooses eager or compiled execution. Compilation also initializes
+            # the attention graph workspaces.
             allowed_compilation_modes = ["VLLM_COMPILE"]
         else:
             allowed_compilation_modes = [None, "NONE"]
@@ -1189,30 +1139,22 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 "layered_prefill_config requires VLLM_COMPILE with "
                 "FULL_DECODE_ONLY, or compilation mode NONE without a graph"
             )
-        if getattr(
-            getattr(ascend_config, "xlite_graph_config", None), "enabled", False
-        ):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support Xlite graph mode"
-            )
+        if getattr(getattr(ascend_config, "xlite_graph_config", None), "enabled", False):
+            raise ValueError("layered_prefill_config Phase 1 does not support Xlite graph mode")
         if kv_transfer_config is not None:
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires connector-free PD-mixed mode"
-            )
+            raise ValueError("layered_prefill_config Phase 1 requires connector-free PD-mixed mode")
         speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is not None and getattr(vllm_config, "use_v2_model_runner", False):
+            # MRV1's MTP/DSpark exception below relies on its draft/aux-output
+            # lifecycle. The MRV2 layered path does not implement that contract.
+            raise ValueError("layered_prefill_config on Model Runner V2 does not support speculative decoding")
         if speculative_config is not None and not (
             is_deepseek_v4
             and getattr(speculative_config, "method", None) in ("mtp", "dspark")
             and parallel_config.pipeline_parallel_size == 1
         ):
-            raise ValueError(
-                "layered_prefill_config currently only supports "
-                "DeepSeek-V4 MTP or DSpark with PP=1"
-            )
-        if (
-            speculative_config is not None
-            and getattr(speculative_config, "method", None) == "dspark"
-        ):
+            raise ValueError("layered_prefill_config currently only supports DeepSeek-V4 MTP or DSpark with PP=1")
+        if speculative_config is not None and getattr(speculative_config, "method", None) == "dspark":
             # DSpark seeds its draft context K/V from the target model's aux
             # hidden states (captured after the dspark target layers).  The
             # layered forward can only emit that list from the single group
@@ -1223,17 +1165,15 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 "hf_config",
                 None,
             )
-            target_layer_ids = getattr(
-                draft_hf_config, "dspark_target_layer_ids", None
-            ) or getattr(draft_hf_config, "target_layer_ids", None)
+            target_layer_ids = getattr(draft_hf_config, "dspark_target_layer_ids", None) or getattr(
+                draft_hf_config, "target_layer_ids", None
+            )
             if not target_layer_ids:
                 raise ValueError(
-                    "layered_prefill_config with DSpark requires the draft "
-                    "config to declare dspark_target_layer_ids"
+                    "layered_prefill_config with DSpark requires the draft config to declare dspark_target_layer_ids"
                 )
             num_hidden_layers = getattr(
-                getattr(vllm_config.model_config, "hf_text_config", None)
-                or vllm_config.model_config,
+                getattr(vllm_config.model_config, "hf_text_config", None) or vllm_config.model_config,
                 "num_hidden_layers",
                 0,
             )
@@ -1242,9 +1182,7 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                 ranges = make_layer_group_ranges(num_hidden_layers, num_groups)
                 last_group = ranges[-1]
                 outside = [
-                    layer_id
-                    for layer_id in target_layer_ids
-                    if not last_group.start <= layer_id < last_group.end
+                    layer_id for layer_id in target_layer_ids if not last_group.start <= layer_id < last_group.end
                 ]
                 if outside:
                     raise ValueError(
@@ -1255,70 +1193,40 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
                         "Reduce allowed_num_groups."
                     )
         if getattr(vllm_config, "lora_config", None) is not None:
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support LoRA"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support LoRA")
         if (
             getattr(vllm_config.model_config, "is_encoder_decoder", False)
             or getattr(vllm_config.model_config, "is_multimodal", False)
             or getattr(vllm_config.model_config, "is_multimodal_model", False)
-            or (
-                getattr(vllm_config.model_config, "is_hybrid", False)
-                and not is_deepseek_v4
-            )
+            or (getattr(vllm_config.model_config, "is_hybrid", False) and not is_deepseek_v4)
         ):
             raise ValueError(
-                "layered_prefill_config Phase 1 supports decoder-only text "
-                "models without recurrent hybrid state"
+                "layered_prefill_config Phase 1 supports decoder-only text models without recurrent hybrid state"
             )
         if getattr(vllm_config.model_config, "enable_return_routed_experts", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support routed-expert return"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support routed-expert return")
         if getattr(getattr(ascend_config, "eplb_config", None), "dynamic_eplb", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support dynamic EPLB"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support dynamic EPLB")
         if getattr(ascend_config, "enable_prefill_mc2", False):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires eager AlltoAll; disable enable_prefill_mc2"
-            )
+            raise ValueError("layered_prefill_config Phase 1 requires eager AlltoAll; disable enable_prefill_mc2")
         if getattr(ascend_config, "enable_shared_expert_dp", False) or getattr(
             ascend_config, "multistream_overlap_shared_expert", False
         ):
-            raise ValueError(
-                "layered_prefill_config Phase 1 does not support shared-expert overlap"
-            )
-        if getattr(ascend_config, "enable_fused_mc2", 0) or getattr(
-            ascend_config, "enable_mc2_hierarchy_comm", False
-        ):
-            raise ValueError(
-                "layered_prefill_config Phase 1 requires eager AlltoAll; disable MC2/fused MC2"
-            )
+            raise ValueError("layered_prefill_config Phase 1 does not support shared-expert overlap")
+        if getattr(ascend_config, "enable_fused_mc2", 0) or getattr(ascend_config, "enable_mc2_hierarchy_comm", False):
+            raise ValueError("layered_prefill_config Phase 1 requires eager AlltoAll; disable MC2/fused MC2")
         if scheduler_extension_config.profiling_chunk_config.enabled:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with profiling_chunk_config"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with profiling_chunk_config")
         if scheduler_extension_config.enable_balance_scheduling:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with balance scheduling"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with balance scheduling")
         if scheduler_extension_config.batch_job_sched_config.enabled:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with batch-job scheduling"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with batch-job scheduling")
         if scheduler_extension_config.short_request_first_config.enabled:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with short-request-first scheduling"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with short-request-first scheduling")
         if scheduler_extension_config.dyntra_lb_config.enabled:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with DyntraLB"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with DyntraLB")
         if scheduler_extension_config.recompute_scheduler_enable:
-            raise ValueError(
-                "layered_prefill_config cannot be combined with recompute scheduling"
-            )
+            raise ValueError("layered_prefill_config cannot be combined with recompute scheduling")
 
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
