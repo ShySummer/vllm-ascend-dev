@@ -45,6 +45,7 @@ from vllm.lora.request import LoRARequest
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -366,6 +367,7 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        gc.unfreeze()
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
@@ -967,6 +969,9 @@ class NPUWorker(WorkerBase):
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        # Match GPUWorker: keep the static startup heap out of runtime GC scans.
+        # Objects allocated during inference remain subject to normal GC.
+        freeze_gc_heap()
         return CompilationTimes(
             language_model=self.vllm_config.compilation_config.compilation_time,
             # `encoder_compilation_time` was added after v0.19.1 (vLLM #39240); fall
