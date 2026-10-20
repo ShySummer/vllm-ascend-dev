@@ -264,7 +264,11 @@ class LayeredV2PPStageForward:
         runner = self.runner
         wire_tokens = self.decode_wire_tokens(len(d_req_ids))
         prepared = runner._prepare_layered_batch(runner._strip_lifecycle_fields(scheduler_output))
-        expected_order = sort_batch_req_ids({req_id: 1 for req_id in d_req_ids}, runner.decode_query_len)
+        expected_order = sort_batch_req_ids(
+            {req_id: 1 for req_id in d_req_ids},
+            getattr(scheduler_output, "scheduled_spec_decode_tokens", {}),
+            runner.decode_query_len,
+        )
         actual_order = [req_id for req_id in prepared.input_batch.req_ids if req_id in set(d_req_ids)]
         if actual_order != expected_order:
             raise RuntimeError("PP mixed and native Decode request order disagree")

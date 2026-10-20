@@ -47,7 +47,7 @@ def implementation():
         get_pp_group=lambda: NS(rank_in_group=0),
         dispatch_cg_and_sync_dp=dispatch,
         get_uniform_token_count=lambda reqs, tokens, query: query,
-        sort_batch_req_ids=lambda tokens, query: list(tokens),
+        sort_batch_req_ids=lambda tokens, drafts, query: list(tokens),
         subset_scheduler_output=lambda schedule, ids, **kwargs: NS(
             num_scheduled_tokens={req: schedule.num_scheduled_tokens[req] for req in ids},
             finished_req_ids=schedule.finished_req_ids,
@@ -283,8 +283,11 @@ def test_boundary_mixed_chunk_sampling_uses_sorted_p_batch(implementation):
     plan.query_tokens = {"long": 5, "short": 2}
     plan.is_final_chunk = False
     plan.sampling_req_ids = ("long",)
+
     def prepare(schedule, **kw):
-        order = impl.sort_batch_req_ids(schedule.num_scheduled_tokens, 1)
+        order = impl.sort_batch_req_ids(
+            schedule.num_scheduled_tokens, getattr(schedule, "scheduled_spec_decode_tokens", {}), 1
+        )
         return impl.base["prepared"](order, p_tokens=plan.query_tokens, pad_to=2)
 
     runner._prepare_layered_batch = prepare

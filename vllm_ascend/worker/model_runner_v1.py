@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import os
 import logging
 import math
 import sys
