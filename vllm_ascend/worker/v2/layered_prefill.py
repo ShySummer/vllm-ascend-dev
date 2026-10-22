@@ -182,15 +182,17 @@ def split_d_p_req_ids(
 
 
 def snapshot_pp_input_batch(input_batch) -> SimpleNamespace:
-    """Copy the fields ``PPHandler`` reads so a later P sample cannot alias them."""
+    """Copy the current ``PPHandler`` contract without aliasing a later P sample.
+
+    v0.30 InputBatch no longer carries max_seq_len_np. PP sampling uses
+    computed tokens, scheduled tokens and prefill length instead.
+    """
     num_reqs = int(input_batch.num_reqs)
-    max_seq = getattr(input_batch, "max_seq_len_np", None)
     return SimpleNamespace(
         req_ids=list(input_batch.req_ids)[:num_reqs],
         num_reqs=num_reqs,
         num_computed_tokens_np=np.array(input_batch.num_computed_tokens_np[:num_reqs], copy=True),
         prefill_len_np=np.array(input_batch.prefill_len_np[:num_reqs], copy=True),
-        max_seq_len_np=(None if max_seq is None else np.array(max_seq[:num_reqs], copy=True)),
         num_scheduled_tokens=np.array(input_batch.num_scheduled_tokens[:num_reqs], copy=True),
         idx_mapping=input_batch.idx_mapping[:num_reqs].detach().clone(),
         idx_mapping_np=np.array(input_batch.idx_mapping_np[:num_reqs], copy=True),
@@ -207,17 +209,11 @@ def concat_pp_input_batches(batches: list) -> SimpleNamespace:
     def _cat_np(attr: str) -> np.ndarray:
         return np.concatenate([getattr(batch, attr)[: batch.num_reqs] for batch in batches])
 
-    max_seq_parts = [batch.max_seq_len_np for batch in batches]
-    if any(part is None for part in max_seq_parts):
-        max_seq = None
-    else:
-        max_seq = np.concatenate([part[: batch.num_reqs] for part, batch in zip(max_seq_parts, batches)])
     return SimpleNamespace(
         req_ids=[req_id for batch in batches for req_id in list(batch.req_ids)[: batch.num_reqs]],
         num_reqs=sum(batch.num_reqs for batch in batches),
         num_computed_tokens_np=_cat_np("num_computed_tokens_np"),
         prefill_len_np=_cat_np("prefill_len_np"),
-        max_seq_len_np=max_seq,
         num_scheduled_tokens=_cat_np("num_scheduled_tokens"),
         idx_mapping=torch.cat([batch.idx_mapping[: batch.num_reqs] for batch in batches], dim=0),
         idx_mapping_np=_cat_np("idx_mapping_np"),
@@ -314,7 +310,6 @@ def _batch_covering_plan(batches, plan: RingStepPlan):
         num_reqs=plan.payload_rows,
         num_computed_tokens_np=_take("num_computed_tokens_np", 0),
         prefill_len_np=_take("prefill_len_np", 0),
-        max_seq_len_np=_take("max_seq_len_np", 0),
         num_scheduled_tokens=_take("num_scheduled_tokens", 0),
         idx_mapping=torch.tensor(idx, dtype=torch.int32),
         idx_mapping_np=idx,
@@ -328,7 +323,6 @@ def _empty_pp_batch(plan: RingStepPlan):
         num_reqs=0,
         num_computed_tokens_np=np.zeros(0, dtype=np.int64),
         prefill_len_np=np.zeros(0, dtype=np.int64),
-        max_seq_len_np=np.zeros(0, dtype=np.int64),
         num_scheduled_tokens=np.zeros(0, dtype=np.int64),
         idx_mapping=torch.zeros(0, dtype=torch.int32),
         idx_mapping_np=np.zeros(0, dtype=np.int32),
@@ -349,7 +343,6 @@ def _select_pp_batches(batches, request_order: Sequence[str]):
             num_reqs=0,
             num_computed_tokens_np=np.zeros(0, dtype=np.int64),
             prefill_len_np=np.zeros(0, dtype=np.int64),
-            max_seq_len_np=np.zeros(0, dtype=np.int64),
             num_scheduled_tokens=np.zeros(0, dtype=np.int64),
             idx_mapping=torch.zeros(0, dtype=torch.int32),
             idx_mapping_np=np.zeros(0, dtype=np.int32),
@@ -371,7 +364,6 @@ def _select_pp_batches(batches, request_order: Sequence[str]):
         num_reqs=len(chosen),
         num_computed_tokens_np=_col("num_computed_tokens_np"),
         prefill_len_np=_col("prefill_len_np"),
-        max_seq_len_np=_col("max_seq_len_np"),
         num_scheduled_tokens=_col("num_scheduled_tokens"),
         idx_mapping=idx,
         idx_mapping_np=idx.numpy().astype(np.int32, copy=True),

@@ -16,10 +16,10 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.v1.core.layered_prefill import LayeredFrontier
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 
 
@@ -222,7 +222,6 @@ class LayeredV2SingleForward:
             "prefill_len_np",
             "num_computed_prefill_tokens_np",
             "is_prefilling_np",
-            "max_seq_len_np",
         ):
             value = getattr(batch, name)
             updates[name] = None if value is None else value[requests].copy()
@@ -244,6 +243,8 @@ class LayeredV2SingleForward:
             seq_lens_np=seq_np,
             dcp_local_seq_lens=None,
             attn_state=AscendAttentionState.DecodeOnly,
+            has_prefill=False,
+            max_query_len=1,
             logits_indices=b.arange(count, torch.long, batch.input_ids.device),
             cu_num_logits=query[: count + 1],
             cu_num_logits_np=query_np[: count + 1],

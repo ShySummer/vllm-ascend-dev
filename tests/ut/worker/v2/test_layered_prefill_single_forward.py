@@ -8,13 +8,14 @@ selection, row layout, frontier ownership and execution are the real code.
 
 import ast
 from contextlib import contextmanager, nullcontext
-from dataclasses import make_dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
 import torch
+import vllm
 
 
 @pytest.fixture
@@ -60,7 +61,8 @@ def prepared(order, p_tokens=3, pad_to=4):
         prefill_len_np=np.arange(count),
         num_computed_prefill_tokens_np=np.arange(count),
         is_prefilling_np=np.array([x in queries for x in order]),
-        max_seq_len_np=None,
+        has_prefill=True,
+        has_structured_output_reqs=False,
         prompt_lens=None,
         dcp_local_seq_lens=None,
         input_ids=torch.arange(padded, dtype=torch.int32) + 1,
@@ -77,7 +79,20 @@ def prepared(order, p_tokens=3, pad_to=4):
         num_draft_tokens_per_req=None,
         attn_state="mixed",
     )
-    batch = make_dataclass("Batch", [(name, object) for name in values])(**values)
+    # Compile the real dataclass definitions, keeping the test CPU-only while
+    # detecting upstream field additions/removals instead of inventing a schema.
+    root = Path(__file__).parents[4]
+    sources = [
+        (Path(vllm.__file__).parent / "v1/worker/gpu/input_batch.py", "InputBatch"),
+        (root / "vllm_ascend/worker/v2/input_batch.py", "AscendInputBatch"),
+    ]
+    namespace = dict(dataclass=dataclass, torch=torch, np=np)
+    for source, name in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        definition = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
+        tree.body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), definition]
+        exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), namespace)
+    batch = namespace["AscendInputBatch"](**values)
     return NS(
         input_batch=batch,
         block_tables=(torch.arange(count * 2).reshape(count, 2),),
@@ -181,6 +196,9 @@ def test_compact_metadata_has_private_storage_and_initialized_padding(implementa
     data = prepared(["d0", "p", "d1"])
     source_slots = data.slot_mappings.clone()
     decode, _, _ = execution.prepare_decode(data, plan(0))
+    assert not hasattr(data.input_batch, "max_seq_len_np")
+    assert not decode.input_batch.has_prefill
+    assert decode.input_batch.max_query_len == 1
     metadata = decode.attn_metadata
     assert metadata["num_reqs"] == 4
     assert metadata["num_actual_tokens"] == 2
@@ -491,3 +509,45 @@ def test_single_forward_sampling_has_one_connector_pair(implementation, has_deco
     assert events.index("pre") < events.index("finish") < events.index("post")
     sampled = [event[1] for event in events if isinstance(event, tuple)]
     assert sampled == ([["d", "p"]] if sample_p else [["d"]] if has_decode else [])
+
+
+@pytest.mark.parametrize(
+    "other_queries,expected", [({"d": 1, "tail": 134}, False), ({"tail": 2}, False), ({"d": 1}, True), ({}, True)]
+)
+@pytest.mark.parametrize("group", [0, 1, 2])
+def test_non_layered_prefill_tail_uses_separate_execution(implementation, other_queries, expected, group):
+    # Reproduce the failing 16K scheduler batch: one Decode token, a normal
+    # 134-token Prefill tail, and the selected 67-token layered Prefill tail.
+    runner = supported_runner()
+    runner._single_forward = True
+    layered_plan = plan(group, p_tokens=67)
+    scheduled = dict(other_queries, p=67)
+    source = Path(__file__).parents[4] / "vllm_ascend/worker/v2/model_runner.py"
+    parsed = ast.parse(source.read_text(encoding="utf-8"))
+    choice = next(
+        node.value
+        for node in ast.walk(parsed)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "single_forward" for target in node.targets)
+    )
+    selected = eval(
+        compile(ast.Expression(choice), str(source), "eval"),
+        dict(
+            self=runner,
+            layered_plan=layered_plan,
+            p_req_ids=["p"],
+            d_req_ids=list(other_queries),
+            scheduler_output=NS(num_scheduled_tokens=scheduled),
+            LayeredV2SingleForward=implementation.LayeredV2SingleForward,
+        ),
+    )
+    assert selected is expected
+    execution, _ = executor(implementation)
+    data = prepared(list(scheduled), p_tokens=scheduled)
+    if expected:
+        execution.prepare_decode(data, layered_plan)
+    else:
+        # Keep the executor's invariant: routing must avoid unsupported rows,
+        # rather than truncate their tokens or suppress the validation error.
+        with pytest.raises(ValueError, match="one token per request"):
+            execution.prepare_decode(data, layered_plan)

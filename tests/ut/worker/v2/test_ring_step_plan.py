@@ -25,7 +25,6 @@ def _batch(req_ids, *, computed, prefill, scheduled, max_seq, indices):
         num_reqs=n,
         num_computed_tokens_np=np.array(computed, dtype=np.int32),
         prefill_len_np=np.array(prefill, dtype=np.int32),
-        max_seq_len_np=np.array(max_seq, dtype=np.int32),
         num_scheduled_tokens=np.array(scheduled, dtype=np.int32),
         idx_mapping=torch.tensor(indices, dtype=torch.int32),
         idx_mapping_np=np.array(indices, dtype=np.int32),

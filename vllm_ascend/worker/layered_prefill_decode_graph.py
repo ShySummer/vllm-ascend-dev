@@ -21,6 +21,8 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.offloader.base import get_offloader
 
+from vllm_ascend.attention.dsa_v1 import reset_compressor_metadata_cache
+
 MAX_DECODE_GRAPH_ENTRIES = 512
 MAX_DECODE_GRAPH_VIEWS = 64
 
@@ -146,9 +148,20 @@ class LayeredDecodeGraphCache:
         def run(values):
             active, ids, pos = values
             runner._set_layered_prefill_moe_layer_offset(start)
-            for idx in range(start, end):
-                active = adapter._forward_layer(adapter.layers[idx], pos, *active, ids)
-            return active
+            # Each capture must record its own compressor metadata producer.
+            # The outer D context spans multiple graphs; cached tensors from a
+            # previous graph may be reused by the shared pool before this graph
+            # replays. Sharing those pointers leaves ScatterNdUpdate reading
+            # another graph's temporary storage as cache coordinates.
+            reset_compressor_metadata_cache()
+            try:
+                for idx in range(start, end):
+                    active = adapter._forward_layer(adapter.layers[idx], pos, *active, ids)
+                return active
+            finally:
+                # Also isolate eager fallback and failed captures from later
+                # graph captures in the same forward context.
+                reset_compressor_metadata_cache()
 
         try:
             metadata_key = graph_signature(metadata)

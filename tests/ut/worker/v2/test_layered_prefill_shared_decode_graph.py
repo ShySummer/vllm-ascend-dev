@@ -72,6 +72,7 @@ def runtime(monkeypatch):
         capturing=False,
         moe_comm_type="allgather",
         num_tokens=2,
+        additional_kwargs={},
     )
     module.get_forward_context = lambda: context
     module.get_offloader = lambda: NS(
@@ -80,6 +81,15 @@ def runtime(monkeypatch):
     )
     module.logger = NS(info=lambda *args: events.append("log"), warning_once=lambda *args: None)
     exec(compile(tree, str(source), "exec"), module.__dict__)
+
+    # Execute the real DSV4 memoization helpers with only device ops mocked.
+    source = ROOT.parent / "attention/dsa_v1.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    names = {"reset_compressor_metadata_cache", "get_or_compute_compressor_metadata"}
+    definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    module._COMPRESSOR_METADATA_CACHE_KEY = "dsv4_compressor_metadata_cache"
+    tree.body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *definitions]
+    exec(compile(ast.fix_missing_locations(tree), str(source), "exec"), module.__dict__)
 
     source = ROOT / "layered_prefill_single_forward.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
@@ -148,3 +158,58 @@ def test_capture_and_replay_without_v1_only_runner_fields(runtime, groups, stage
     assert events.count("log") == (groups // 2 if rank == 0 else 0)
     assert lookups == ([rank] * (groups // 2) if version == "v2" else [])
     assert offsets[-1] == (stage + 1) * 16
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_compressor_metadata_is_local_to_each_decode_graph(runtime, fallback):
+    module, context, events = runtime
+    produced, consumed = [], []
+    sentinel = object()
+    context.additional_kwargs["unrelated"] = sentinel
+
+    def compressor_op(*args):
+        result = tuple(Tensor(len(produced)) for _ in range(3))
+        produced.append(result)
+        return result
+
+    module.torch.ops = NS(_C_ascend=NS(compressor_metadata=compressor_op))
+    module.get_dsa_attn_kv_plan = lambda _: NS(get_dsa_compressor_slot_mapping_format=lambda: 0)
+    full_rope = NS(shape=(2, 2), view=lambda *args: Tensor(0))
+    metadata = NS(
+        cache_group_key="c4",
+        full_compress_cos=full_rope,
+        full_compress_sin=full_rope,
+        num_compressed_tokens=1,
+        start_pos=Tensor(0),
+        num_actual_reqs=1,
+        query_start_loc=Tensor(0),
+        block_table=Tensor(0),
+        storage_block_size=128,
+    )
+
+    def layer(index, positions, hidden, residual, ids):
+        result = module.get_or_compute_compressor_metadata(metadata, 4, None)
+        consumed.append(result)
+        return hidden, residual
+
+    runner = NS(
+        device="npu",
+        tp_rank=0,
+        layered_prefill_model_adapter=NS(layers=list(range(4)), _forward_layer=layer),
+        _set_layered_prefill_moe_layer_offset=lambda _: None,
+    )
+    cache = module.LayeredDecodeGraphCache(runner)
+    if fallback:
+        module.MAX_DECODE_GRAPH_ENTRIES = 0
+    for start in (0, 2):
+        cache.forward(start, start + 2, (Tensor(1), None), None, Tensor(0))
+    # Reuse within a graph, but never capture a pointer produced by another graph.
+    assert len(produced) == 2
+    assert consumed[0] is consumed[1]
+    assert consumed[2] is consumed[3]
+    assert consumed[0] is not consumed[2]
+    assert module._COMPRESSOR_METADATA_CACHE_KEY not in context.additional_kwargs
+    assert context.additional_kwargs["unrelated"] is sentinel
+    if not fallback:
+        cache.forward(0, 2, (Tensor(2), None), None, Tensor(0))
+        assert len(produced) == 2  # replay does not execute Python builders

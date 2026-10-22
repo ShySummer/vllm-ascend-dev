@@ -1652,6 +1652,10 @@ class NPUModelRunner(GPUModelRunner):
             and len(p_req_ids) == 1
             and LayeredV2SingleForward.supports_plan(layered_plan)
             and LayeredV2SingleForward.supported(self)
+            # Requests outside the layered plan can include ordinary chunked
+            # Prefill tails. Compact Decode only supports one token per row;
+            # route those mixed batches through the separate D/P path.
+            and all(scheduler_output.num_scheduled_tokens[r] == 1 for r in d_req_ids)
         )
         pp_stage_mixed = LayeredV2PPStageForward.supported(self, layered_plan, d_req_ids, scheduler_output)
         # A stage with no work in this layer group relays it instead of

@@ -15,6 +15,8 @@ from vllm.v1.worker.gpu.pp_utils import build_ring_step_plan, compute_need_sampl
 from vllm_ascend.worker.v2.layered_prefill import (
     LayeredPPHandlerCapture,
     LayeredV2ExecuteModelState,
+    _batch_covering_plan,
+    _select_pp_batches,
     compute_layered_need_sampled_mask,
     concat_pp_input_batches,
     snapshot_pp_input_batch,
@@ -37,7 +39,6 @@ def _pp_batch(
         num_reqs=num_reqs,
         num_computed_tokens_np=np.array(computed, dtype=np.int32),
         prefill_len_np=np.array(prefill, dtype=np.int32),
-        max_seq_len_np=np.array(max_seq, dtype=np.int32),
         num_scheduled_tokens=np.array(scheduled, dtype=np.int32),
         idx_mapping=torch.tensor(req_indices, dtype=torch.int32),
         idx_mapping_np=np.array(req_indices, dtype=np.int32),
@@ -1257,3 +1258,31 @@ def test_compiled_p_executes_only_local_layers_and_finalizes_on_last_stage(
         assert persist.call_args.kwargs["reuse_existing"] is True
     else:
         runner.layered_prefill_state.clear.assert_called_once_with("p")
+
+
+@pytest.mark.parametrize("legacy_none", [False, True])
+def test_pp_snapshot_reorders_and_pads_without_legacy_max_seq(legacy_none):
+    batch = _pp_batch(
+        ["d", "p"],
+        computed=[8, 0],
+        prefill=[8, 4],
+        scheduled=[1, 4],
+        max_seq=[64, 64],
+        req_indices=[7, 3],
+    )
+    # Current MRV2 batches omit this field; older snapshots could contain None.
+    if legacy_none:
+        batch.max_seq_len_np = None
+    snapshot = snapshot_pp_input_batch(batch)
+    assert not hasattr(snapshot, "max_seq_len_np")
+    reordered = _select_pp_batches([snapshot], ["p", "missing", "d"])
+    assert reordered.req_ids == ["p", "d"]
+    assert reordered.idx_mapping_np.tolist() == [3, 7]
+    assert reordered.num_scheduled_tokens.tolist() == [4, 1]
+    assert compute_need_sampled_mask(reordered).tolist() == [True, True]
+    plan = SimpleNamespace(sampled_request_order=("p", "missing", "d"), payload_rows=3)
+    padded = _batch_covering_plan([snapshot], plan)
+    assert padded.idx_mapping_np.tolist() == [3, -1, 7]
+    assert padded.num_computed_tokens_np.tolist() == [0, 0, 8]
+    assert padded.num_scheduled_tokens.tolist() == [4, 0, 1]
+    assert _select_pp_batches([snapshot], ["missing"]).num_reqs == 0
