@@ -58,7 +58,11 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolTailSpec,
+    AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -859,11 +863,14 @@ class KVCacheRecvingThread(threading.Thread):
             if self.vllm_config.speculative_config is not None and prefill_pp_rank == self._prefill_pp_size - 1:
                 end_layer_index += self.num_draft_layers
             is_index_cache_plane = group_spec.get("kv_cache_spec_type") == "AscendSFAIndexerCacheSpec"
+            metadata_layer_offset = group_spec.get(
+                "metadata_layer_offset", self.index_cache_plane_base if is_index_cache_plane else 0
+            )
 
             def in_partition(metadata_layer_idx: int) -> bool:
                 transformer_layer = (
-                    metadata_layer_idx - self.index_cache_plane_base
-                    if is_index_cache_plane and metadata_layer_idx >= self.index_cache_plane_base
+                    metadata_layer_idx - metadata_layer_offset
+                    if metadata_layer_offset and metadata_layer_idx >= metadata_layer_offset
                     else metadata_layer_idx
                 )
                 return first_layer_index <= transformer_layer < end_layer_index
@@ -2333,7 +2340,10 @@ class MooncakeConnectorWorker:
         in MiniMax M3 and ``.indexer.k_cache`` in GLM-5.2), so identify the
         physical layout from its cache spec instead of its name.
         """
-        return isinstance(self._get_layer_spec(layer_name), AscendSFAIndexerCacheSpec)
+        spec = self._get_layer_spec(layer_name)
+        return isinstance(spec, AscendSFAIndexerCacheSpec) or (
+            getattr(spec, "model_version", None) == "glm5_next" and getattr(spec, "tokens_per_state", 1) > 1
+        )
 
     @staticmethod
     def _build_layer_specs_from_kv_cache_config(
@@ -2368,8 +2378,13 @@ class MooncakeConnectorWorker:
         # TODO: Extand this key with KV cache layout fields (for example num_dims)
         # if a future model has layers with the same number of kv heads but incompatiible
         # cache shapes.
+        transfer_layout = type(spec).__name__
+        if getattr(spec, "model_version", None) == "glm5_next" and getattr(spec, "tokens_per_state", 1) > 1:
+            # The full-history manager pairs main MLA with compressed indexer
+            # pages. They have distinct tensor parts and metadata planes.
+            transfer_layout += ":compressed_indexer"
         return (
-            type(spec).__name__,
+            transfer_layout,
             cls._get_spec_num_key_value_heads(spec),
             total_num_kv_heads,
         )
@@ -2382,7 +2397,7 @@ class MooncakeConnectorWorker:
     def _get_spec_total_num_kv_heads(self, spec: Any, layer_idx: int) -> int | None:
         # AscendSFAIndexerCacheSpec inherits MLAAttentionSpec for scheduler
         # grouping, but remains a distinct key-only transfer layout.
-        if isinstance(spec, AscendSFAIndexerCacheSpec):
+        if isinstance(spec, (AscendSFAIndexerCacheSpec, AscendIndexerKPoolTailSpec)):
             return 1
         if isinstance(spec, (MLAAttentionSpec, AscendSlidingWindowMLASpec)):
             return 1
@@ -2420,6 +2435,8 @@ class MooncakeConnectorWorker:
                 if "mtp" in layer_name or "eagle" in layer_name:
                     layer_idx = next_mtp_layer_idx
                     next_mtp_layer_idx += 1
+                elif isinstance(self._get_layer_spec(layer_name), AscendIndexerKPoolTailSpec):
+                    layer_idx = self.total_layers * 3 + extract_layer_index(layer_name, num_attn_module)
                 elif self._is_index_cache_layer(layer_name):
                     layer_idx = index_cache_plane_base + extract_layer_index(layer_name, num_attn_module)
                 else:
@@ -2459,6 +2476,10 @@ class MooncakeConnectorWorker:
                     ),
                     layer_indices,
                 )
+                if isinstance(kv_cache_spec, AscendIndexerKPoolTailSpec):
+                    kv_group2layeridx[transfer_group_id][0]["metadata_layer_offset"] = self.total_layers * 3
+                elif self._is_index_cache_layer(layer_names[0]):
+                    kv_group2layeridx[transfer_group_id][0]["metadata_layer_offset"] = index_cache_plane_base
                 transfer_group_id += 1
         return kv_group2layeridx
 
@@ -2934,7 +2955,9 @@ class MooncakeConnectorWorker:
         to the shorter one so remote/local stay aligned.
         """
         kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
-        if group_spec["kv_cache_spec_type"] == "MambaSpec":
+        if group_spec["kv_cache_spec_type"] in ("MambaSpec", "AscendIndexerKPoolTailSpec"):
+            # The non-cacheable KPool tail owns one request-private ring. Its
+            # logical block must survive even when full-history KV has a hit.
             return list(meta.local_block_ids[kv_cache_group_id]), list(meta.remote_block_ids[kv_cache_group_id])
 
         remote_block_size = meta.remote_block_size or self.block_size
